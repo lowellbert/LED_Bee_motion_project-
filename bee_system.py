@@ -35,9 +35,12 @@ EDGE_PAD_RATIO = 0.08         # hysteresis to prevent boundary chatter
 # Optional local preview (won't work headless over SSH unless X-forwarded)
 SHOW_PREVIEW = False
 
+SHOW_DEBUG_WINDOW = True     # shows "Bee Debug" window (requires desktop session)
+SHOW_MASK_WINDOW  = True     # shows motion mask window
+HEARTBEAT_EVERY_N = 30       # prints heartbeat every N frames
 # ---------------- VLC ----------------
 VLC_ARGS = [
-    "--fullscreen",
+   # "--fullscreen",
     "--intf", "dummy",
     "--no-video-title-show",
     "--quiet",
@@ -250,144 +253,196 @@ def main():
         if not Path(p).exists():
             raise FileNotFoundError(f"Missing video for {k}: {p}")
 
-    cap = cv2.VideoCapture("/dev/video0", cv2.CAP_V4L2)
+    cap = None
+    player = None
 
-    # Prefer MJPEG on USB webcams (less CPU, more stable on Pi)
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    cap.set(cv2.CAP_PROP_FPS, 30)
+    try:
+        # ---- Camera open ----
+        cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_V4L2)
 
-    # Reduce buffering latency
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        # Prefer MJPEG on USB webcams (less CPU, more stable on Pi)
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-    time.sleep(0.5)  # give the webcam a moment to settle
+        time.sleep(0.5)  # give the webcam a moment to settle
 
-    if not cap.isOpened():
-        raise RuntimeError("Camera not available (V4L2 open failed)")
+        if not cap.isOpened():
+            raise RuntimeError("Camera not available (V4L2 open failed)")
 
-    ret, test = cap.read()
-    if not ret:
-        raise RuntimeError("Camera opened but no frames received")
+        ret, test = cap.read()
+        if not ret or test is None:
+            raise RuntimeError("Camera opened but no frames received")
 
-    print("Camera mode:",
-          cap.get(cv2.CAP_PROP_FRAME_WIDTH),
-          cap.get(cv2.CAP_PROP_FRAME_HEIGHT),
-          cap.get(cv2.CAP_PROP_FPS))
+        print("Camera mode:",
+              cap.get(cv2.CAP_PROP_FRAME_WIDTH),
+              cap.get(cv2.CAP_PROP_FRAME_HEIGHT),
+              cap.get(cv2.CAP_PROP_FPS))
+        actual_w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+        actual_h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        actual_fps = cap.get(cv2.CAP_PROP_FPS)
+        print(f"[CAM] requested=640x480@30, actual={actual_w:.0f}x{actual_h:.0f}@{actual_fps:.0f}", flush=True)
 
-    if not cap.isOpened():
-        raise RuntimeError("Camera not available")
+        # ---- Background subtraction ----
+        bgs = cv2.createBackgroundSubtractorMOG2(
+            history=300,
+            varThreshold=32,
+            detectShadows=False
+        )
 
-    # Background subtraction (more stable than frame-diff for presence)
-    bgs = cv2.createBackgroundSubtractorMOG2(
-        history=300,
-        varThreshold=32,
-        detectShadows=False
-    )
-    warmup_until = time.time() + 2.0
+        warmup_until = time.time() + 2.0
+        zone_width = DETECT_W // 3
+        edge_pad = int(zone_width * EDGE_PAD_RATIO)
 
-    zone_width = DETECT_W // 3
-    edge_pad = int(zone_width * EDGE_PAD_RATIO)
+        # Presence and zone stability state
+        present = False
+        last_seen = 0.0
+        stable_zone = None
+        stable_count = 0
+        last_committed_zone = "centre"
 
-    # Presence and zone stability state
-    present = False
-    last_seen = 0.0
-    stable_zone = None
-    stable_count = 0
-    last_committed_zone = "centre"
+        player = BeePlayer(VIDEOS)
+        player.start()
 
-    player = BeePlayer(VIDEOS)
-    player.start()
+        print("System running... Ctrl+C to stop.")
 
-    print("System running... Ctrl+C to stop.")
+        frame_count = 0
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            continue
+        while True:
+            frame_count += 1
 
-        # Downscale for detection
-        small = cv2.resize(frame, (DETECT_W, DETECT_H))
-        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+            ret, frame = cap.read()
+            if frame_count % 30 == 0:
+                print(f"\n[FRAME] ret={ret} shape={None if frame is None else frame.shape}", flush=True)
+            if not ret or frame is None:
+                # If the camera hiccups, keep looping (but don’t spin at 100% CPU)
+                time.sleep(0.02)
+                continue
 
-        fg = bgs.apply(gray)
-        if time.time() < warmup_until:
-            continue
+            # Downscale for detection
+            small = cv2.resize(frame, (DETECT_W, DETECT_H))
+            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
 
-        # Mask cleanup
-        fg = cv2.GaussianBlur(fg, (5, 5), 0)
-        _, fg = cv2.threshold(fg, 128, 255, cv2.THRESH_BINARY)
-        fg = cv2.dilate(fg, None, iterations=2)
-        fg = cv2.erode(fg, None, iterations=1)
+            fg = bgs.apply(gray)
+            
+            # ---- WARMUP: still pump OpenCV windows so they stay live ----
+            if time.time() < warmup_until:
+                if SHOW_DEBUG_WINDOW:
+                    cv2.imshow("Bee Debug", frame)
+                if SHOW_MASK_WINDOW:
+                    cv2.imshow("Motion Mask", fg)
 
-        zone, area, cx = compute_zone_from_mask(fg, zone_width, edge_pad)
-        # SSH-friendly live status line (updates in-place)
-        present_now = (zone is not None and area >= PRESENCE_AREA)
-        nz = cv2.countNonZero(fg)
-        print(f"zone={zone} area={area:.0f} nz={nz} present={present_now} cx={cx}", end="\r", flush=True)
+                if SHOW_DEBUG_WINDOW or SHOW_MASK_WINDOW:
+                    if (cv2.waitKey(1) & 0xFF) == ord("q"):
+                        return  # exit main cleanly during warmup
 
-        now = time.time()
-
-        # Update last_seen if we have meaningful foreground
-        if zone is not None and area >= PRESENCE_AREA:
-            last_seen = now
-
-        was_present = present
-        present = (now - last_seen) < PRESENCE_HOLD
-
-        # Desired mode logic
-        if not present:
-            # nobody present -> always centre loop
-            player.set_desired_mode("centre")
-
-            stable_zone = None
-            stable_count = 0
-            last_committed_zone = "centre"
-
-            # if we’re not already centre and not in transition, go back to centre
-            if player.mode != "centre" and not player.busy:
-                player.transition_to("centre")
-
-        else:
-            # presence detected: stabilize zone to avoid jitter
-            if zone is not None:
-                if zone == stable_zone:
-                    stable_count += 1
-                else:
-                    stable_zone = zone
-                    stable_count = 1
-
-                if stable_count >= ZONE_STABLE_FRAMES:
-                    player.set_desired_mode(stable_zone)
-
-                    # Only transition when zone actually changes
-                    if stable_zone != last_committed_zone and not player.busy:
-                        player.transition_to(stable_zone)
-                        last_committed_zone = stable_zone
-
-        # IMPORTANT: If user changed zones while a transition is playing,
-        # this will catch up immediately after we land on the loop.
-        if not player.busy:
-            desired = player.desired_mode
-            if desired != player.mode:
-                player.transition_to(desired)
+                continue
 
 
-        # Watchdog: restart if VLC stopped/ended unexpectedly
-        player.ensure_playing()
-        print(".", end="", flush=True)
-        if SHOW_PREVIEW:
-            preview = cv2.cvtColor(fg, cv2.COLOR_GRAY2BGR)
-            cv2.line(preview, (zone_width, 0), (zone_width, DETECT_H), (255, 0, 0), 1)
-            cv2.line(preview, (zone_width * 2, 0), (zone_width * 2, DETECT_H), (255, 0, 0), 1)
-            if cx is not None:
-                cv2.circle(preview, (int(cx), DETECT_H // 2), 6, (0, 255, 0), -1)
-            cv2.imshow("Detection Mask", preview)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
-    cap.release()
-    cv2.destroyAllWindows()
+            # Mask cleanup
+            fg = cv2.GaussianBlur(fg, (5, 5), 0)
+            _, fg = cv2.threshold(fg, 128, 255, cv2.THRESH_BINARY)
+            fg = cv2.dilate(fg, None, iterations=2)
+            fg = cv2.erode(fg, None, iterations=1)
 
+            zone, area, cx = compute_zone_from_mask(fg, zone_width, edge_pad)
+            nz = cv2.countNonZero(fg)
+
+            present_now = (zone is not None and area >= PRESENCE_AREA)
+
+            # SSH-friendly status line
+            print(f"zone={zone} area={area:.0f} nz={nz} present={present_now} cx={cx}",
+                  end="\r", flush=True)
+
+            # Heartbeat (prints as a new line occasionally so you can tell it’s alive)
+            if frame_count % HEARTBEAT_EVERY_N == 0:
+                print(f"\n[HB] frames={frame_count} present_now={present_now} area={area:.0f} nz={nz} zone={zone}",
+                      flush=True)
+
+            now = time.time()
+            if present_now:
+                last_seen = now
+
+            present = (now - last_seen) < PRESENCE_HOLD
+
+            # Desired mode logic
+            if not present:
+                player.set_desired_mode("centre")
+                stable_zone = None
+                stable_count = 0
+                last_committed_zone = "centre"
+
+                if player.mode != "centre" and not player.busy:
+                    player.transition_to("centre")
+            else:
+                # stabilize zone to avoid jitter
+                if zone is not None:
+                    if zone == stable_zone:
+                        stable_count += 1
+                    else:
+                        stable_zone = zone
+                        stable_count = 1
+
+                    if stable_count >= ZONE_STABLE_FRAMES:
+                        player.set_desired_mode(stable_zone)
+
+                        if stable_zone != last_committed_zone and not player.busy:
+                            player.transition_to(stable_zone)
+                            last_committed_zone = stable_zone
+
+            # Catch-up desired mode after transition ends
+            if not player.busy:
+                desired = player.desired_mode
+                if desired != player.mode:
+                    player.transition_to(desired)
+
+            # VLC watchdog
+            player.ensure_playing()
+
+            # ---- Debug visuals (only if enabled) ----
+            if SHOW_DEBUG_WINDOW:
+                dbg = frame.copy()
+                cv2.putText(dbg, f"zone={zone} present={present}", (10, 25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(dbg, f"area={area:.0f} nz={nz} cx={cx}", (10, 55),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.imshow("Bee Debug", dbg)
+
+            if SHOW_MASK_WINDOW:
+                cv2.imshow("Motion Mask", fg)
+
+            if SHOW_DEBUG_WINDOW or SHOW_MASK_WINDOW:
+                # allow 'q' to quit cleanly
+
+                if (cv2.waitKey(1) & 0xFF) == ord("q"):
+                    break
+
+    except KeyboardInterrupt:
+        print("\n[INFO] Ctrl+C received, shutting down...", flush=True)
+
+    finally:
+        # Always release hardware/resources
+        try:
+            if player is not None:
+                try:
+                    player.player.stop()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        try:
+            if cap is not None:
+                cap.release()
+        except Exception:
+            pass
+
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
