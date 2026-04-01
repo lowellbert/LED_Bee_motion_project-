@@ -34,10 +34,10 @@ EDGE_PAD_RATIO = 0.08         # hysteresis to prevent boundary chatter
 
 # Optional local preview (won't work headless over SSH unless X-forwarded)
 SHOW_PREVIEW = False
-
-SHOW_DEBUG_WINDOW = True     # shows "Bee Debug" window (requires desktop session)
-SHOW_MASK_WINDOW  = True     # shows motion mask window
-HEARTBEAT_EVERY_N = 30       # prints heartbeat every N frames
+SHOW_DEBUG_WINDOW = True # shows "Bee Debug" window (requires desktop session)
+SHOW_MASK_WINDOW = True # shows motion mask window
+HEARTBEAT_EVERY_N = 30 # prints heartbeat every N frames
+CAMERA_STALE_SECONDS = 2.0
 # ---------------- VLC ----------------
 VLC_ARGS = [
    # "--fullscreen",
@@ -53,38 +53,149 @@ VLC_ARGS = [
 ]
 
 
+class FrameGrabber:
+    def __init__(self, device_index=0, width=640, height=480, fps=30):
+        self.device_index = device_index
+        self.width = width
+        self.height = height
+        self.fps = fps
+
+        self.cap = None
+        self.thread = None
+        self.stop_event = threading.Event()
+        self.lock = threading.Lock()
+
+        self.latest_frame = None
+        self.latest_timestamp = 0.0
+        self.frame_count = 0
+        self.read_error_count = 0
+        self.started = False
+
+    def open_camera(self):
+        cap = cv2.VideoCapture(self.device_index, cv2.CAP_V4L2)
+
+        if not cap.isOpened():
+            raise RuntimeError(f"Could not open camera index {self.device_index}")
+
+        # Configure camera
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        cap.set(cv2.CAP_PROP_FPS, self.fps)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        # Optional: print negotiated settings for debug
+        actual_w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+        actual_h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        actual_fps = cap.get(cv2.CAP_PROP_FPS)
+        print(f"[FrameGrabber] Camera opened: {actual_w}x{actual_h} @ {actual_fps:.2f} fps")
+
+        self.cap = cap
+
+    def start(self):
+        if self.started:
+            return
+
+        self.open_camera()
+        self.stop_event.clear()
+        self.thread = threading.Thread(target=self._reader_loop, name="FrameGrabber", daemon=True)
+        self.thread.start()
+        self.started = True
+        print("[FrameGrabber] Started")
+
+    def _reader_loop(self):
+        print("[FrameGrabber] Reader loop running")
+        while not self.stop_event.is_set():
+            try:
+                ret, frame = self.cap.read()
+            except Exception as e:
+                self.read_error_count += 1
+                print(f"[FrameGrabber] cap.read() exception: {e}")
+                time.sleep(0.1)
+                continue
+
+            if not ret or frame is None:
+                self.read_error_count += 1
+                print("[FrameGrabber] cap.read() returned no frame")
+                time.sleep(0.02)
+                continue
+
+            now = time.time()
+            with self.lock:
+                self.latest_frame = frame
+                self.latest_timestamp = now
+                self.frame_count += 1
+
+        print("[FrameGrabber] Reader loop exiting")
+
+    def get_latest_frame(self, copy=True):
+        with self.lock:
+            if self.latest_frame is None:
+                return None, 0.0
+            frame = self.latest_frame.copy() if copy else self.latest_frame
+            ts = self.latest_timestamp
+        return frame, ts
+
+    def age(self):
+        with self.lock:
+            ts = self.latest_timestamp
+        if ts == 0.0:
+            return float("inf")
+        return time.time() - ts
+
+    def has_frame(self):
+        with self.lock:
+            return self.latest_frame is not None
+
+    def stop(self, join_timeout=1.0):
+        print("[FrameGrabber] Stopping...")
+        self.stop_event.set()
+
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=join_timeout)
+            if self.thread.is_alive():
+                print("[FrameGrabber] Warning: reader thread did not exit (likely blocked in cap.read())")
+
+        if self.cap is not None:
+            try:
+                self.cap.release()
+                print("[FrameGrabber] Camera released")
+            except Exception as e:
+                print(f"[FrameGrabber] Error releasing camera: {e}")
+
+        self.started = False
+        
 class BeePlayer:
     """
     State machine for playback:
-      - Always in one of: loop_centre / loop_left / loop_right
-      - Plays transition clips to change modes
-      - Main loop decides when to transition; VLC callback just lands on the next loop
+    - Always in one of: loop_centre / loop_left / loop_right
+    - Plays transition clips to change modes
+    - Main loop decides when to transition
+    - Main loop also polls VLC for transition completion
     """
+
     def __init__(self, videos: dict):
         self.instance = vlc.Instance(*VLC_ARGS)
         self.player = self.instance.media_player_new()
 
         # Preload media objects for faster switches
-        # Add input-repeat=-1 ONLY to loop clips so they never "end"
+        # Add input-repeat=-1 ONLY to loop clips so they loop inside VLC
         self.media = {}
         for k, v in videos.items():
             m = self.instance.media_new_path(v)
-
-            # k is a tuple like ("centre","loop") or ("centre","left")
             if k[1] == "loop":
-                m.add_option(":input-repeat=-1")  # loop forever inside VLC
-
+                m.add_option(":input-repeat=-1")
             self.media[k] = m
 
         self.lock = threading.Lock()
-        self.mode = "centre"            # current loop mode
-        self.busy = False               # True while a transition is playing
-        self.looping = True             # True while a loop clip is playing
-        self.next_mode = "centre"       # target mode after transition ends
-        self.desired_mode = "centre"    # requested mode from detection
+        self.mode = "centre"          # current loop mode
+        self.busy = False             # True while a transition is playing
+        self.looping = True           # True while a loop clip is playing
+        self.next_mode = "centre"     # target mode after transition ends
+        self.desired_mode = "centre"  # requested mode from detection
 
-        em = self.player.event_manager()
-        em.event_attach(vlc.EventType.MediaPlayerEndReached, self._on_end)
+        self._last_vlc_time = -1
+        self._last_vlc_progress_ts = time.time()
 
     def start(self):
         self._play_loop("centre")
@@ -99,72 +210,16 @@ class BeePlayer:
         self.player.set_media(self.media[key])
         self.player.play()
 
+        # Reset playback watchdog timing whenever media changes
+        self._last_vlc_time = -1
+        self._last_vlc_progress_ts = time.time()
+
     def _play_loop(self, mode: str):
         self.mode = mode
         self.busy = False
         self.next_mode = mode
         self._play((mode, "loop"), looping=True)
         print(f"[VLC] LOOP -> {mode}")
-
-    def ensure_playing(self):
-        """
-        Robust loop watchdog for kiosk installs:
-        - Handle VLC ending/stopping/pausing
-        - Loop using known loop duration (your test loops are 5.00s)
-        - Detect stalled playback (time stops advancing)
-        """
-        if self.busy:
-            return
-
-        # Only apply watchdog to loop clips
-        if not self.looping:
-            return
-
-        # ---- 1) Restart on bad states (include Paused) ----
-        st = self.player.get_state()
-        if st in (vlc.State.Ended, vlc.State.Stopped, vlc.State.Error, vlc.State.Paused):
-            print(f"\n[VLC] Watchdog restart (state={st})")
-            self.player.stop()
-            self.player.set_media(self.media[(self.mode, "loop")])
-            self.player.play()
-            # reset stall tracking
-            self._last_vlc_time = 0
-            self._last_vlc_progress_ts = time.time()
-            return
-
-        # ---- 2) Seamless loop based on known duration ----
-        # Your generated loop clips are exactly 5.00 seconds
-        LOOP_MS = 5000
-        t = self.player.get_time()  # ms (can be -1 on some builds)
-        if t is not None and t >= 0:
-            # soft loop just before end
-            if t >= (LOOP_MS - 120):
-                self.player.set_time(0)
-
-        # ---- 3) Stall detection: if time stops advancing near end ----
-        now = time.time()
-        if not hasattr(self, "_last_vlc_time"):
-            self._last_vlc_time = -1
-            self._last_vlc_progress_ts = now
-
-        t2 = self.player.get_time()
-        if t2 is None:
-            t2 = -1
-
-        if t2 != self._last_vlc_time:
-            self._last_vlc_time = t2
-            self._last_vlc_progress_ts = now
-        else:
-            # If no progress for >0.6s and we're near end, hard restart
-            if (now - self._last_vlc_progress_ts) > 0.6 and t2 > 4500:
-                print("\n[VLC] Watchdog restart (stall near end)")
-                self.player.stop()
-                self.player.set_media(self.media[(self.mode, "loop")])
-                self.player.play()
-                self._last_vlc_time = 0
-                self._last_vlc_progress_ts = now
-
-
 
     def transition_to(self, target_mode: str):
         """
@@ -197,20 +252,58 @@ class BeePlayer:
             print("[VLC] WARNING: Missing transition clip; forcing loop switch")
             self._play_loop(target_mode)
 
-    def _on_end(self, event):
-        # VLC thread callback: keep it simple and thread-safe.
-        with self.lock:
-            if self.looping:
-                # loop ended, restart same loop
-                self._play((self.mode, "loop"), looping=True)
-                return
+    def poll(self):
+        """
+        Main-thread polling for transition completion.
+        Avoids doing playback control inside VLC callback threads.
+        """
+        if not self.busy:
+            return
 
-            # transition ended, land on the target loop
+        st = self.player.get_state()
+        if st in (vlc.State.Ended, vlc.State.Stopped, vlc.State.Error):
             target = self.next_mode
+            print(f"[VLC] Transition complete -> {target}")
+            self._play_loop(target)
 
-        # play loop outside lock to keep things smooth
-        self._play_loop(target)
+    def ensure_playing(self):
+        """
+        Loop watchdog for kiosk installs:
+        - restart on bad states
+        - restart if playback time stops advancing
+        """
+        if self.busy:
+            return
 
+        if not self.looping:
+            return
+
+        st = self.player.get_state()
+        if st in (vlc.State.Ended, vlc.State.Stopped, vlc.State.Error, vlc.State.Paused):
+            print(f"\n[VLC] Watchdog restart (state={st})")
+            self.player.stop()
+            self.player.set_media(self.media[(self.mode, "loop")])
+            self.player.play()
+            self._last_vlc_time = -1
+            self._last_vlc_progress_ts = time.time()
+            return
+
+        now = time.time()
+        t = self.player.get_time()
+        if t is None:
+            t = -1
+
+        if t != self._last_vlc_time:
+            self._last_vlc_time = t
+            self._last_vlc_progress_ts = now
+        else:
+            if (now - self._last_vlc_progress_ts) > 1.0:
+                print(f"\n[VLC] Watchdog restart (playback stalled at t={t}ms)")
+                self.player.stop()
+                self.player.set_media(self.media[(self.mode, "loop")])
+                self.player.play()
+                self._last_vlc_time = -1
+                self._last_vlc_progress_ts = now
 
 def compute_zone_from_mask(mask, zone_width, edge_pad):
     """
@@ -253,36 +346,31 @@ def main():
         if not Path(p).exists():
             raise FileNotFoundError(f"Missing video for {k}: {p}")
 
-    cap = None
+    grabber = None
     player = None
 
     try:
         # ---- Camera open ----
-        cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_V4L2)
+        # ---- Camera open (threaded grabber) ----
+        grabber = FrameGrabber(device_index=CAM_INDEX, width=640, height=480, fps=30)
+        grabber.start()
 
-        # Prefer MJPEG on USB webcams (less CPU, more stable on Pi)
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        cap.set(cv2.CAP_PROP_FPS, 30)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        print("[Main] Waiting for first camera frame...", flush=True)
+        startup_deadline = time.time() + 5.0
 
-        time.sleep(0.5)  # give the webcam a moment to settle
+        while not grabber.has_frame():
+            if time.time() > startup_deadline:
+                raise RuntimeError("Timed out waiting for first camera frame")
 
-        if not cap.isOpened():
-            raise RuntimeError("Camera not available (V4L2 open failed)")
+            if SHOW_DEBUG_WINDOW or SHOW_MASK_WINDOW:
+                if (cv2.waitKey(1) & 0xFF) == ord("q"):
+                    return
 
-        ret, test = cap.read()
-        if not ret or test is None:
-            raise RuntimeError("Camera opened but no frames received")
+            time.sleep(0.01)
 
-        print("Camera mode:",
-              cap.get(cv2.CAP_PROP_FRAME_WIDTH),
-              cap.get(cv2.CAP_PROP_FRAME_HEIGHT),
-              cap.get(cv2.CAP_PROP_FPS))
-        actual_w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-        actual_h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-        actual_fps = cap.get(cv2.CAP_PROP_FPS)
+        actual_w = grabber.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+        actual_h = grabber.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        actual_fps = grabber.cap.get(cv2.CAP_PROP_FPS)
         print(f"[CAM] requested=640x480@30, actual={actual_w:.0f}x{actual_h:.0f}@{actual_fps:.0f}", flush=True)
 
         # ---- Background subtraction ----
@@ -313,18 +401,64 @@ def main():
         while True:
             frame_count += 1
 
-            ret, frame = cap.read()
+            frame, frame_ts = grabber.get_latest_frame(copy=True)
+            frame_age = grabber.age()
+
             if frame_count % 30 == 0:
-                print(f"\n[FRAME] ret={ret} shape={None if frame is None else frame.shape}", flush=True)
-            if not ret or frame is None:
-                # If the camera hiccups, keep looping (but don’t spin at 100% CPU)
+                print(f"\n[FRAME] age={frame_age:.3f}s shape={None if frame is None else frame.shape}", flush=True)
+
+            if frame is None:
+                player.ensure_playing()
+
+                if SHOW_DEBUG_WINDOW or SHOW_MASK_WINDOW:
+                    if (cv2.waitKey(1) & 0xFF) == ord("q"):
+                        break
+
                 time.sleep(0.02)
+                continue
+
+            if frame_age > CAMERA_STALE_SECONDS:
+                print(f"\n[CAM] WARNING: stale frame age={frame_age:.2f}s", flush=True)
+
+                player.ensure_playing()
+
+                if SHOW_DEBUG_WINDOW:
+                    dbg = frame.copy()
+                    cv2.putText(
+                        dbg,
+                        f"CAMERA STALLED age={frame_age:.1f}s",
+                        (10, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (0, 0, 255),
+                        2,
+                    )
+                    cv2.imshow("Bee Debug", dbg)
+
+                if SHOW_MASK_WINDOW:
+                    stale_mask = cv2.resize(frame, (DETECT_W, DETECT_H))
+                    stale_mask = cv2.cvtColor(stale_mask, cv2.COLOR_BGR2GRAY)
+                    cv2.putText(
+                        stale_mask,
+                        f"STALE {frame_age:.1f}s",
+                        (10, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        255,
+                        2,
+                    )
+                    cv2.imshow("Motion Mask", stale_mask)
+
+                if SHOW_DEBUG_WINDOW or SHOW_MASK_WINDOW:
+                    if (cv2.waitKey(1) & 0xFF) == ord("q"):
+                        break
+
+                time.sleep(0.05)
                 continue
 
             # Downscale for detection
             small = cv2.resize(frame, (DETECT_W, DETECT_H))
             gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-
             fg = bgs.apply(gray)
             
             # ---- WARMUP: still pump OpenCV windows so they stay live ----
@@ -392,6 +526,9 @@ def main():
                             player.transition_to(stable_zone)
                             last_committed_zone = stable_zone
 
+            # Poll VLC transition completion from the main thread
+            player.poll()
+
             # Catch-up desired mode after transition ends
             if not player.busy:
                 desired = player.desired_mode
@@ -423,26 +560,35 @@ def main():
         print("\n[INFO] Ctrl+C received, shutting down...", flush=True)
 
     finally:
-        # Always release hardware/resources
+        print("[CLEANUP] starting", flush=True)
+
         try:
             if player is not None:
+                print("[CLEANUP] stopping VLC player", flush=True)
                 try:
                     player.player.stop()
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                    print("[CLEANUP] VLC player stopped", flush=True)
+                except Exception as e:
+                    print(f"[CLEANUP] VLC stop error: {e}", flush=True)
+        except Exception as e:
+            print(f"[CLEANUP] outer VLC cleanup error: {e}", flush=True)
 
         try:
-            if cap is not None:
-                cap.release()
-        except Exception:
-            pass
+            if grabber is not None:
+                print("[CLEANUP] stopping grabber", flush=True)
+                grabber.stop()
+                print("[CLEANUP] grabber stopped", flush=True)
+        except Exception as e:
+            print(f"[CLEANUP] grabber cleanup error: {e}", flush=True)
 
         try:
+            print("[CLEANUP] destroying windows", flush=True)
             cv2.destroyAllWindows()
-        except Exception:
-            pass
+            print("[CLEANUP] windows destroyed", flush=True)
+        except Exception as e:
+            print(f"[CLEANUP] destroyAllWindows error: {e}", flush=True)
+
+        print("[CLEANUP] done", flush=True)
 
 if __name__ == "__main__":
     main()
