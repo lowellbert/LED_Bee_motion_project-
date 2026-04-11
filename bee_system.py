@@ -37,7 +37,8 @@ VIDEO_REACT_2 = Path("/home/beedisplay/projects/LED_Bee_motion_project-/videos/r
 CAMERA_DEVICE     = "/dev/video0"
 CAPTURE_WIDTH     = 640
 CAPTURE_HEIGHT    = 480
-DETECT_SCALE      = 0.4       # Downscale factor for motion detection (perf)
+DETECT_SCALE      = 0.25      # Downscale factor for motion detection (perf)
+DETECT_INTERVAL   = 0.10      # run motion detection at 10fps max, not 30fps
 MOG2_HISTORY      = 500
 MOG2_THRESHOLD    = 50
 MIN_AREA          = 1500      # Minimum contour area to count as real motion
@@ -137,6 +138,12 @@ class BeePlayer:
             "--no-video-title-show",
             "--quiet",
             "--no-xlib",                    # prevents X threading conflicts on Pi
+            "--codec=h264_mmal",          # Pi hardware H.264 decode
+            "--no-drop-late-frames",
+            "--no-skip-frames",
+            "--file-caching=300",
+            "--no-audio"
+
         ]
         if fullscreen:
             vlc_args += [
@@ -315,7 +322,12 @@ def main():
     detector = MotionDetector()
 
     last_motion_time = 0.0
+    last_detect_time  = 0.0
     frame_count      = 0
+    motion            = False   # — persist last known motion state
+    zone              = None    
+    dbg_frame         = None  
+
 
     # Pre-create the named debug window once so it doesn't flicker
     if debug_mode:
@@ -335,10 +347,13 @@ def main():
                 continue
 
             # ── Motion detection ──────────────────────────────────────────────
-            motion, zone, dbg_frame = detector.process(frame, debug_mode)
+            # ── Motion detection — throttled to DETECT_INTERVAL ───────────────
+            now = time.time()
+            if now - last_detect_time >= DETECT_INTERVAL:
+                motion, zone, dbg_frame = detector.process(frame, debug_mode)
+                last_detect_time = now
 
             # ── State machine ─────────────────────────────────────────────────
-            now             = time.time()
             cooldown_active = (now - last_motion_time) < MOTION_COOLDOWN
 
             if motion and player.is_idle and not cooldown_active:
@@ -352,7 +367,7 @@ def main():
                 cv2.imshow("Bee Debug — press D to toggle", dbg_frame)
 
             # ── Key handling ──────────────────────────────────────────────────
-            key = cv2.waitKey(1) & 0xFF
+            key = cv2.waitKey(1) & 0xFF if debug_mode else 0xFF
 
             if key == ord('d') or key == ord('D'):
                 debug_mode = not debug_mode
@@ -374,7 +389,7 @@ def main():
                       f"player={player._state} "
                       f"debug={'ON' if debug_mode else 'OFF'}")
 
-            time.sleep(MAIN_LOOP_SLEEP)
+            time.sleep(MAIN_LOOP_SLEEP if debug_mode else 0.10)
 
     except KeyboardInterrupt:
         print("\n[SHUTDOWN] Ctrl+C received.")
