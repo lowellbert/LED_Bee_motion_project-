@@ -167,6 +167,9 @@ class FrameGrabber:
                     self._frame     = frame.copy()
                     self._last_time = time.time()
 
+                time.sleep(0.08)        # ← yield CPU — don't consume pipe faster than needed
+
+
             except Exception as e:
                 print(f"[FrameGrabber] Read error: {e}")
                 break
