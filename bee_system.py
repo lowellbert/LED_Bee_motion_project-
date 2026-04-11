@@ -118,6 +118,7 @@ class FrameGrabber:
             "-framerate",   str(CAPTURE_FPS),  # camera input rate
             "-video_size",  f"{width}x{height}",
             "-i",           device,            # camera device
+            "-vf",           "format=yuv420p",   # ← ADD: explicit format conversion
             "-f",           "rawvideo",        # output raw frames
             "-pix_fmt",     "bgr24",           # OpenCV native format
             "-r",           str(DETECT_OUTPUT_FPS),  # throttle output to 10fps
@@ -137,28 +138,39 @@ class FrameGrabber:
         self._thread.start()
         print("[FrameGrabber] ffmpeg capture thread started.")
 
-    def _run(self):
+    def _run(self): 
         """
-        Reads exactly one frame (width*height*3 bytes) per loop iteration.
-        ffmpeg handles all rate limiting — this loop only wakes up when a
-        new frame arrives at the pipe, then immediately sleeps waiting for
-        the next one. No busy-spinning.
+        Reads exactly one full frame per cycle using a chunked accumulator.
+        pipe.read(N) may return fewer than N bytes — we loop until we have
+        a complete frame worth of bytes before decoding.
         """
         while self._running:
             try:
-                raw = self._proc.stdout.read(self._frame_size)
-                if len(raw) != self._frame_size:
-                    print("[FrameGrabber] Pipe closed or short read — stopping.")
+                # Accumulate bytes until we have one full frame
+                buf = bytearray()
+                remaining = self._frame_size
+                while remaining > 0 and self._running:
+                    chunk = self._proc.stdout.read(remaining)
+                    if not chunk:
+                        print("[FrameGrabber] Pipe closed.")
+                        return
+                    buf += chunk
+                    remaining -= len(chunk)
+
+                if len(buf) != self._frame_size:
                     break
-                frame = np.frombuffer(raw, dtype=np.uint8).reshape(
+
+                frame = np.frombuffer(buf, dtype=np.uint8).reshape(
                     (self._height, self._width, 3)
                 )
                 with self._lock:
                     self._frame     = frame.copy()
                     self._last_time = time.time()
+
             except Exception as e:
                 print(f"[FrameGrabber] Read error: {e}")
                 break
+
 
     def get_latest_frame(self):
         with self._lock:
