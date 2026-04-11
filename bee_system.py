@@ -4,7 +4,7 @@ bee_system.py — Raspberry Pi Motion-Reactive Video Kiosk
 ---------------------------------------------------------
 Idle state   : loops idle.mp4 continuously
 Motion event : randomly plays react_1.mp4 or react_2.mp4, then returns to idle
-Debug mode   : enabled via --debug flag OR press 'D' at runtime to toggle
+Debug mode   : enabled via --debug flag OR press D at runtime to toggle
 Fullscreen   : default on, suppressed in debug mode
 
 Usage:
@@ -20,39 +20,41 @@ import random
 import argparse
 import sys
 import os
+import select
 from pathlib import Path
 
 # ── Force display environment for SSH + local HDMI use ──────────────────────
 os.environ.setdefault("DISPLAY", ":0")
 os.environ.setdefault("XAUTHORITY", "/home/beedisplay/.Xauthority")
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # CONFIG — edit paths and tuning values here
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 VIDEO_IDLE    = Path("/home/beedisplay/projects/LED_Bee_motion_project-/videos/idle.mp4")
 VIDEO_REACT_1 = Path("/home/beedisplay/projects/LED_Bee_motion_project-/videos/react_1.mp4")
 VIDEO_REACT_2 = Path("/home/beedisplay/projects/LED_Bee_motion_project-/videos/react_2.mp4")
 
 CAMERA_DEVICE     = "/dev/video0"
-CAPTURE_WIDTH     = 320
-CAPTURE_HEIGHT    = 240
-DETECT_SCALE      = 0.25      # Downscale factor for motion detection (perf)
-DETECT_INTERVAL   = 0.10      # run motion detection at 10fps max, not 30fps
-MOG2_HISTORY      = 200
-MOG2_THRESHOLD    = 40
-MIN_AREA          = 1500      # Minimum contour area to count as real motion
-MOTION_COOLDOWN   = 3.0       # Seconds to ignore motion after a reaction starts
-FRAME_STALE_LIMIT = 3.0       # Seconds before camera is considered stalled
-MAIN_LOOP_SLEEP   = 0.033     # ~30 Hz main loop target
+CAPTURE_WIDTH     = 320        # halved from 640 — less pixel data per frame
+CAPTURE_HEIGHT    = 240        # halved from 480
+DETECT_SCALE      = 0.5        # 0.5 on 320x240 = 160x120 detection image
+DETECT_INTERVAL   = 0.10       # run motion detection at 10fps max
+MOG2_HISTORY      = 200        # faster background model adaptation
+MOG2_THRESHOLD    = 40         # foreground sensitivity
+MIN_AREA          = 800        # minimum contour area (adjusted for lower res)
+MOTION_COOLDOWN   = 3.0        # seconds to ignore new motion after reaction starts
+FRAME_STALE_LIMIT = 3.0        # seconds before camera is considered stalled
+MAIN_LOOP_SLEEP   = 0.10       # 10Hz main loop in kiosk mode
+DEBUG_LOOP_SLEEP  = 0.033      # ~30Hz in debug mode for responsive preview
 
-# Zone boundaries (as fraction of frame width)
+# Zone boundaries as fraction of detection frame width
 ZONE_LEFT_MAX  = 0.33
 ZONE_RIGHT_MIN = 0.67
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # ARGUMENT PARSING
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 parser = argparse.ArgumentParser(description="Bee Motion Video System")
 parser.add_argument(
@@ -61,65 +63,118 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # VALIDATE VIDEO FILES
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 for vpath in [VIDEO_IDLE, VIDEO_REACT_1, VIDEO_REACT_2]:
     if not vpath.exists():
         print(f"[ERROR] Video file not found: {vpath}")
         sys.exit(1)
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # FRAME GRABBER — threaded camera capture
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 class FrameGrabber:
     """
-    Runs camera capture in a background thread.
-    Main loop calls get_latest_frame() — never blocks on cap.read().
+    Runs camera capture in a background thread paced at 15fps (camera minimum).
+    Uses select() on the V4L2 file descriptor so cap.read() is only called when
+    the kernel signals a frame is ready AND the minimum interval has elapsed.
+    This prevents the thread from busy-spinning and consuming excessive CPU.
     """
     def __init__(self, device, width, height):
+        # Force camera to 15fps at driver level — camera minimum is 15fps,
+        # setting 10fps is silently ignored by this camera model
+        print("[FrameGrabber] Setting camera to 15fps via v4l2-ctl...")
+        ret = os.system(f"v4l2-ctl --device={device} --set-parm=15 2>/dev/null")
+        if ret == 0:
+            print("[FrameGrabber] v4l2-ctl FPS set OK")
+        else:
+            print("[FrameGrabber] v4l2-ctl failed — relying on thread pacing")
+
         self._cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
+
+        # Request MJPEG — compressed format, far less memory bandwidth than YUYV
+        self._cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        print("[FrameGrabber] Requested MJPEG format")
+
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
-        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)  
-        self._cap.set(cv2.CAP_PROP_FPS, 10)          # ← cap camera at 10fps at hardware level
+        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self._cap.set(cv2.CAP_PROP_FPS, 15)
         self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-
-        # Confirm actual FPS set
-        actual_fps = self._cap.get(cv2.CAP_PROP_FPS)
-        print(f"[FrameGrabber] Capture FPS set to: {actual_fps}")
-
-
-        
 
         if not self._cap.isOpened():
             raise RuntimeError(f"[FrameGrabber] Cannot open camera: {device}")
+
+        actual_w   = self._cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+        actual_h   = self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        actual_fps = self._cap.get(cv2.CAP_PROP_FPS)
+        actual_cc  = int(self._cap.get(cv2.CAP_PROP_FOURCC))
+        fourcc_str = (
+            chr(actual_cc & 0xFF) +
+            chr((actual_cc >> 8) & 0xFF) +
+            chr((actual_cc >> 16) & 0xFF) +
+            chr((actual_cc >> 24) & 0xFF)
+        )
+        print(f"[FrameGrabber] Opened: {actual_w:.0f}x{actual_h:.0f} @ {actual_fps:.1f}fps  format={fourcc_str}")
 
         self._frame     = None
         self._lock      = threading.Lock()
         self._last_time = time.time()
         self._running   = True
-        self._thread    = threading.Thread(target=self._run, daemon=True)
+        self._thread    = threading.Thread(target=self._run, daemon=True, name="FrameGrabber")
         self._thread.start()
-        print("[FrameGrabber] Camera thread started.")
+        print("[FrameGrabber] Capture thread started.")
 
     def _run(self):
-        target_interval = 1.0 / 10.0   # 10fps max — matches DETECT_INTERVAL
+        """
+        Uses select() to wait on the V4L2 file descriptor before reading.
+        This is the OS-correct way to pace camera reads on Linux:
+          - cap.read() is only called when the kernel signals a frame is ready
+          - A minimum interval gate (1/15s) prevents reading faster than needed
+          - No busy-spinning between frames
+        """
+        target_interval = 1.0 / 15.0   # camera hardware minimum is 15fps
+        last_grab       = 0.0
+
+        # Try to get the underlying V4L2 file descriptor for select()
+        fd = -1
+        if hasattr(cv2, "CAP_PROP_VIDEO_CAPTURE_FD"):
+            fd = int(self._cap.get(cv2.CAP_PROP_VIDEO_CAPTURE_FD))
+        use_select = fd > 0
+
+        if use_select:
+            print(f"[FrameGrabber] Using select() on fd={fd}")
+        else:
+            print("[FrameGrabber] select() not available — using interval sleep pacing")
+
         while self._running:
-            t0 = time.time()
+            now        = time.time()
+            since_last = now - last_grab
+
+            # Enforce minimum interval — never read faster than 15fps
+            if since_last < target_interval:
+                time.sleep(target_interval - since_last)
+                continue
+
+            # Wait for kernel to signal frame ready (up to 200ms timeout)
+            if use_select:
+                ready, _, _ = select.select([fd], [], [], 0.2)
+                if not ready:
+                    # Timeout — no frame from kernel yet, loop back
+                    continue
+
             ret, frame = self._cap.read()
+            last_grab  = time.time()
+
             if ret and frame is not None:
                 with self._lock:
                     self._frame     = frame
                     self._last_time = time.time()
-            # Sleep for remainder of target interval to avoid busy-spinning
-            elapsed = time.time() - t0
-            remaining = target_interval - elapsed
-            if remaining > 0:
-                time.sleep(remaining)
-
+            else:
+                # Failed read — short sleep to avoid tight error loop
+                time.sleep(0.05)
 
     def get_latest_frame(self):
         with self._lock:
@@ -137,15 +192,18 @@ class FrameGrabber:
         print("[FrameGrabber] Camera released.")
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # BEE PLAYER — VLC state machine
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 class BeePlayer:
     """
     Two-state VLC controller:
-      IDLE      -> loops idle.mp4
+      IDLE      -> loops idle.mp4 continuously
       REACTING  -> plays a reaction video once, then returns to IDLE
+
+    VLC is configured for Pi hardware H.264 decode via MMAL to offload
+    decoding from the ARM CPU to the GPU. Falls back to avcodec if needed.
     """
     STATE_IDLE     = "IDLE"
     STATE_REACTING = "REACTING"
@@ -154,25 +212,23 @@ class BeePlayer:
         vlc_args = [
             "--no-video-title-show",
             "--quiet",
-            "--no-xlib",                    # prevents X threading conflicts on Pi
-            "--codec=h264_mmal",          # Pi hardware H.264 decode
-            "--no-drop-late-frames",
-            "--no-skip-frames",
-            "--file-caching=300",
-            "--no-audio"
-
+            "--no-xlib",            # prevents X threading conflicts with OpenCV on Pi
+            "--codec=h264_mmal",    # hardware H.264 decode via Pi GPU (MMAL)
+            "--avcodec-hw=any",     # fallback: use any available hardware decode
+            "--file-caching=300",   # small file cache, videos are local
+            "--no-audio",           # no audio decode overhead
         ]
         if fullscreen:
             vlc_args += [
                 "--fullscreen",
-                "--video-on-top",           # forces VLC window to front of display
+                "--video-on-top",
             ]
         else:
             vlc_args += [
                 "--no-fullscreen",
                 "--width=800",
                 "--height=600",
-                "--video-on-top",           # keeps VLC visible next to CV2 debug window
+                "--video-on-top",
             ]
 
         self._instance   = vlc.Instance(" ".join(vlc_args))
@@ -190,29 +246,29 @@ class BeePlayer:
 
     def _play_idle(self):
         media = self._make_media(VIDEO_IDLE)
-        media.add_option("input-repeat=65535")   # loop effectively forever
+        media.add_option("input-repeat=65535")
         self._player.set_media(media)
         self._player.play()
         self._state = self.STATE_IDLE
         print("[BeePlayer] -> IDLE loop")
 
     def trigger_reaction(self):
-        """Called when motion is detected. Picks a random reaction video."""
+        """Pick a random reaction video and play it once."""
         chosen = random.choice([VIDEO_REACT_1, VIDEO_REACT_2])
         media  = self._make_media(chosen)
         self._player.set_media(media)
         self._player.play()
         self._state = self.STATE_REACTING
-        print(f"[BeePlayer] -> REACTING  ({chosen.name})")
+        print(f"[BeePlayer] -> REACTING ({chosen.name})")
 
     def poll(self):
         """
-        Called every main loop cycle.
-        Detects end-of-reaction and transitions back to idle.
+        Call every main loop cycle.
+        Detects end-of-reaction video and transitions back to IDLE.
         """
         if self._state == self.STATE_REACTING:
-            state = self._player.get_state()
-            if state in (vlc.State.Ended, vlc.State.Stopped, vlc.State.Error):
+            st = self._player.get_state()
+            if st in (vlc.State.Ended, vlc.State.Stopped, vlc.State.Error):
                 print("[BeePlayer] Reaction ended -> returning to IDLE")
                 self._play_idle()
 
@@ -225,15 +281,18 @@ class BeePlayer:
         print("[BeePlayer] Stopped.")
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # MOTION DETECTOR
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 class MotionDetector:
     """
-    MOG2-based motion detector.
-    Returns (motion_detected: bool, zone: str, debug_frame)
-    zone is one of: 'left', 'centre', 'right', or None
+    MOG2 background subtraction on a greyscale downscaled image.
+    Processing greyscale (1 channel) instead of BGR (3 channels) cuts
+    MOG2 CPU cost by ~3x for the same detection result.
+
+    Returns (motion_detected: bool, zone: str or None, debug_frame or None)
+    zone is one of: 'left', 'centre', 'right'
     """
     def __init__(self):
         self._bg = cv2.createBackgroundSubtractorMOG2(
@@ -241,21 +300,25 @@ class MotionDetector:
             varThreshold=MOG2_THRESHOLD,
             detectShadows=False
         )
+        # Pre-build morphology kernel once — rect is cheaper than ellipse
+        self._kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
 
     def process(self, frame, debug_mode: bool):
-        h, w    = frame.shape[:2]
-        dw      = int(w * DETECT_SCALE)
-        dh      = int(h * DETECT_SCALE)
-        small   = cv2.resize(frame, (dw, dh))
+        h, w  = frame.shape[:2]
+        dw    = int(w * DETECT_SCALE)
+        dh    = int(h * DETECT_SCALE)
 
-        mask    = self._bg.apply(small)
-        mask    = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
-                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+        # Downscale then convert to greyscale — MOG2 on 1 channel is ~3x cheaper
+        small = cv2.resize(frame, (dw, dh))
+        grey  = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        mask  = self._bg.apply(grey)
+        mask  = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self._kernel)
 
         cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         motion_detected = False
         zone            = None
+        # Build debug overlay on the original colour frame, not the grey one
         debug_frame     = frame.copy() if debug_mode else None
 
         for cnt in cnts:
@@ -266,8 +329,8 @@ class MotionDetector:
             motion_detected = True
             M = cv2.moments(cnt)
             if M["m00"] > 0:
-                cx      = M["m10"] / M["m00"]
-                cx_norm = cx / dw   # normalised 0.0 to 1.0
+                cx_raw  = M["m10"] / M["m00"]
+                cx_norm = cx_raw / dw
 
                 if cx_norm < ZONE_LEFT_MAX:
                     zone = "left"
@@ -276,7 +339,6 @@ class MotionDetector:
                 else:
                     zone = "centre"
 
-            # Scale contour back to full resolution for overlay
             if debug_mode and debug_frame is not None:
                 scale_x    = w / dw
                 scale_y    = h / dh
@@ -284,7 +346,6 @@ class MotionDetector:
                 cv2.drawContours(debug_frame, [cnt_scaled], -1, (0, 255, 0), 2)
 
         if debug_mode and debug_frame is not None:
-            # Draw zone divider lines on full-res frame
             cv2.line(debug_frame,
                      (int(w * ZONE_LEFT_MAX), 0),
                      (int(w * ZONE_LEFT_MAX), h),
@@ -293,8 +354,6 @@ class MotionDetector:
                      (int(w * ZONE_RIGHT_MIN), 0),
                      (int(w * ZONE_RIGHT_MIN), h),
                      (255, 100, 0), 1)
-
-            # Status label
             label = f"MOTION: {zone}" if motion_detected else "idle"
             color = (0, 255, 100) if motion_detected else (180, 180, 180)
             cv2.putText(debug_frame, label,
@@ -304,26 +363,26 @@ class MotionDetector:
         return motion_detected, zone, debug_frame
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # MAIN
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    cv2.startWindowThread()   # required on Pi for CV2 GUI event loop
+    cv2.startWindowThread()
     debug_mode = args.debug
 
-    print("=" * 52)
+    print("=" * 54)
     print("  Bee Motion Video System")
     print(f"  Mode    : {'DEBUG' if debug_mode else 'KIOSK'}")
     print(f"  Idle    : {VIDEO_IDLE.name}")
     print(f"  React 1 : {VIDEO_REACT_1.name}")
     print(f"  React 2 : {VIDEO_REACT_2.name}")
     print("  Press D to toggle debug | Ctrl+C to quit")
-    print("=" * 52)
+    print("=" * 54)
 
     grabber = FrameGrabber(CAMERA_DEVICE, CAPTURE_WIDTH, CAPTURE_HEIGHT)
 
-    # ── Wait for camera to produce first valid frame ─────────────────────────
+    # Wait for camera to produce its first valid frame before starting VLC
     print("[INIT] Waiting for camera warm-up...")
     warmup_start = time.time()
     while grabber.get_latest_frame() is None:
@@ -338,18 +397,18 @@ def main():
     player   = BeePlayer(fullscreen=not debug_mode)
     detector = MotionDetector()
 
+    # Persistent detection state — carried between throttled cycles
     last_motion_time = 0.0
-    last_detect_time  = 0.0
+    last_detect_time = 0.0
+    motion           = False
+    zone             = None
+    dbg_frame        = None
     frame_count      = 0
-    motion            = False   # — persist last known motion state
-    zone              = None    
-    dbg_frame         = None  
 
-
-    # Pre-create the named debug window once so it doesn't flicker
+    # Pre-create debug window once to avoid per-frame overhead
     if debug_mode:
-        cv2.namedWindow("Bee Debug — press D to toggle", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("Bee Debug — press D to toggle", 640, 480)
+        cv2.namedWindow("Bee Debug - press D to toggle", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Bee Debug - press D to toggle", 640, 480)
 
     try:
         while True:
@@ -363,12 +422,16 @@ def main():
                 time.sleep(0.1)
                 continue
 
-            # ── Motion detection ──────────────────────────────────────────────
-            # ── Motion detection — throttled to DETECT_INTERVAL ───────────────
             now = time.time()
+
+            # ── Motion detection — only runs at DETECT_INTERVAL rate ──────────
             if now - last_detect_time >= DETECT_INTERVAL:
                 motion, zone, dbg_frame = detector.process(frame, debug_mode)
                 last_detect_time = now
+            else:
+                # Between detection cycles — yield CPU and skip rest of loop
+                time.sleep(0.01)
+                continue
 
             # ── State machine ─────────────────────────────────────────────────
             cooldown_active = (now - last_motion_time) < MOTION_COOLDOWN
@@ -377,36 +440,39 @@ def main():
                 player.trigger_reaction()
                 last_motion_time = now
 
-            player.poll()   # check if reaction ended -> back to idle
+            player.poll()   # check if reaction ended -> back to IDLE
 
             # ── Debug window ──────────────────────────────────────────────────
             if debug_mode and dbg_frame is not None:
-                cv2.imshow("Bee Debug — press D to toggle", dbg_frame)
+                cv2.imshow("Bee Debug - press D to toggle", dbg_frame)
 
-            # ── Key handling ──────────────────────────────────────────────────
-            key = cv2.waitKey(1) & 0xFF if debug_mode else 0xFF
+            # ── Key handling — only pump waitKey in debug mode ────────────────
+            if debug_mode:
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("d") or key == ord("D"):
+                    debug_mode = not debug_mode
+                    print(f"[DEBUG] Mode toggled -> {'ON' if debug_mode else 'OFF'}")
+                    if debug_mode:
+                        cv2.namedWindow("Bee Debug - press D to toggle", cv2.WINDOW_NORMAL)
+                        cv2.resizeWindow("Bee Debug - press D to toggle", 640, 480)
+                    else:
+                        cv2.destroyAllWindows()
+                elif key == ord("q") or key == 27:
+                    print("[QUIT] User requested exit.")
+                    break
 
-            if key == ord('d') or key == ord('D'):
-                debug_mode = not debug_mode
-                print(f"[DEBUG] Mode toggled -> {'ON' if debug_mode else 'OFF'}")
-                if debug_mode:
-                    cv2.namedWindow("Bee Debug — press D to toggle", cv2.WINDOW_NORMAL)
-                    cv2.resizeWindow("Bee Debug — press D to toggle", 640, 480)
-                else:
-                    cv2.destroyAllWindows()
-
-            elif key == ord('q') or key == 27:   # Q or ESC
-                print("[QUIT] User requested exit.")
-                break
-
+            # ── Heartbeat ─────────────────────────────────────────────────────
             frame_count += 1
             if frame_count % 150 == 0:
-                print(f"[HEARTBEAT] frames={frame_count} "
-                      f"cam_age={grabber.age():.2f}s "
-                      f"player={player._state} "
-                      f"debug={'ON' if debug_mode else 'OFF'}")
+                print(
+                    f"[HEARTBEAT] frames={frame_count} "
+                    f"cam_age={grabber.age():.2f}s "
+                    f"player={player._state} "
+                    f"debug={'ON' if debug_mode else 'OFF'}"
+                )
 
-            time.sleep(MAIN_LOOP_SLEEP if debug_mode else 0.10)
+            # ── Loop sleep — kiosk slower to free CPU for VLC ─────────────────
+            time.sleep(DEBUG_LOOP_SLEEP if debug_mode else MAIN_LOOP_SLEEP)
 
     except KeyboardInterrupt:
         print("\n[SHUTDOWN] Ctrl+C received.")
@@ -421,3 +487,21 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# =============================================================================
+# run.sh — recommended launcher script
+# Save as run.sh in project root, then: chmod +x run.sh
+# Usage:  ./run.sh            (kiosk mode)
+#         ./run.sh --debug    (debug mode)
+# =============================================================================
+# #!/bin/bash
+# set -e
+# # Force camera to 15fps at V4L2 driver level (camera minimum — 10fps ignored)
+# v4l2-ctl --device=/dev/video0 --set-parm=15
+# cd ~/projects/LED_Bee_motion_project-
+# source .venv/bin/activate
+# export DISPLAY=:0
+# export XAUTHORITY=/home/beedisplay/.Xauthority
+# PYTHONUNBUFFERED=1 python3 -u bee_system.py "$@"
+# =============================================================================
