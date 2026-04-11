@@ -1,594 +1,345 @@
+#!/usr/bin/env python3
+"""
+bee_system.py — Raspberry Pi Motion-Reactive Video Kiosk
+---------------------------------------------------------
+Idle state   : loops idle.mp4 continuously
+Motion event : randomly plays react_1.mp4 or react_2.mp4, then returns to idle
+Debug mode   : enabled via --debug flag OR press 'D' at runtime to toggle
+Fullscreen   : default on, suppressed in debug mode
+
+Usage:
+    python3 bee_system.py           # Kiosk / production mode
+    python3 bee_system.py --debug   # Debug mode with CV2 windows and overlays
+"""
+
 import cv2
-import time
 import vlc
+import time
 import threading
+import random
+import argparse
+import sys
 from pathlib import Path
 
-# ---------------- PATHS ----------------
-VIDEO_DIR = Path("/home/beedisplay/motion_project/videos")
+# ─────────────────────────────────────────────
+# CONFIG — edit paths and tuning values here
+# ─────────────────────────────────────────────
 
-VIDEOS = {
-    # loops
-    ("centre", "loop"): str(VIDEO_DIR / "loop_centre.mp4"),
-    ("left",   "loop"): str(VIDEO_DIR / "loop_left.mp4"),
-    ("right",  "loop"): str(VIDEO_DIR / "loop_right.mp4"),
+VIDEO_IDLE    = Path("/home/beedisplay/projects/LED_Bee_motion_project-/videos/idle.mp4")
+VIDEO_REACT_1 = Path("/home/beedisplay/projects/LED_Bee_motion_project-/videos/react_1.mp4")
+VIDEO_REACT_2 = Path("/home/beedisplay/projects/LED_Bee_motion_project-/videos/react_2.mp4")
 
-    # transitions (one-shots)
-    ("centre", "left"):  str(VIDEO_DIR / "trans_centre_to_left.mp4"),
-    ("left",   "centre"): str(VIDEO_DIR / "trans_left_to_centre.mp4"),
-    ("centre", "right"): str(VIDEO_DIR / "trans_centre_to_right.mp4"),
-    ("right",  "centre"): str(VIDEO_DIR / "trans_right_to_centre.mp4"),
-}
+CAMERA_DEVICE     = "/dev/video0"
+CAPTURE_WIDTH     = 640
+CAPTURE_HEIGHT    = 480
+DETECT_SCALE      = 0.4       # Downscale factor for motion detection (perf)
+MOG2_HISTORY      = 500
+MOG2_THRESHOLD    = 50
+MIN_AREA          = 1500      # Minimum contour area to count as real motion
+MOTION_COOLDOWN   = 3.0       # Seconds to ignore motion after a reaction starts
+FRAME_STALE_LIMIT = 3.0       # Seconds before camera is considered stalled
+MAIN_LOOP_SLEEP   = 0.033     # ~30 Hz main loop target
 
-# ---------------- CAMERA ----------------
-CAM_INDEX = 0
+# Zone boundaries (as fraction of frame width)
+ZONE_LEFT_MAX   = 0.33
+ZONE_RIGHT_MIN  = 0.67
 
-# Detection runs at low res for speed
-DETECT_W, DETECT_H = 320, 180
+# ─────────────────────────────────────────────
+# ARGUMENT PARSING
+# ─────────────────────────────────────────────
 
-# Presence + stability tuning
-PRESENCE_AREA = 1200          # raise if false triggers; lower if missing people
-PRESENCE_HOLD = 4.0           # seconds to keep "present" after last good detection
-ZONE_STABLE_FRAMES = 4        # how many frames zone must be consistent before switching
-EDGE_PAD_RATIO = 0.08         # hysteresis to prevent boundary chatter
+parser = argparse.ArgumentParser(description="Bee Motion Video System")
+parser.add_argument(
+    "--debug", action="store_true",
+    help="Enable debug mode: shows CV2 windows and motion overlays"
+)
+args = parser.parse_args()
 
-# Optional local preview (won't work headless over SSH unless X-forwarded)
-SHOW_PREVIEW = False
-SHOW_DEBUG_WINDOW = True # shows "Bee Debug" window (requires desktop session)
-SHOW_MASK_WINDOW = True # shows motion mask window
-HEARTBEAT_EVERY_N = 30 # prints heartbeat every N frames
-CAMERA_STALE_SECONDS = 2.0
-# ---------------- VLC ----------------
-VLC_ARGS = [
-   # "--fullscreen",
-    "--intf", "dummy",
-    "--no-video-title-show",
-    "--quiet",
-    "--file-caching=150",
-    "--network-caching=150",
-    "--vout=xcb_x11",
-    # If you see tearing/glitches on your display, try ONE of these:
-    # "--vout=gl",
-    # "--vout=xcb_x11",
-]
+# ─────────────────────────────────────────────
+# VALIDATE VIDEO FILES
+# ─────────────────────────────────────────────
 
+for vpath in [VIDEO_IDLE, VIDEO_REACT_1, VIDEO_REACT_2]:
+    if not vpath.exists():
+        print(f"[ERROR] Video file not found: {vpath}")
+        sys.exit(1)
+
+# ─────────────────────────────────────────────
+# FRAME GRABBER — threaded camera capture
+# ─────────────────────────────────────────────
 
 class FrameGrabber:
-    def __init__(self, device_index=0, width=640, height=480, fps=30):
-        self.device_index = device_index
-        self.width = width
-        self.height = height
-        self.fps = fps
+    """
+    Runs camera capture in a background thread.
+    Main loop calls get_latest_frame() — never blocks on cap.read().
+    """
+    def __init__(self, device, width, height):
+        self._cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
+        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
+        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-        self.cap = None
-        self.thread = None
-        self.stop_event = threading.Event()
-        self.lock = threading.Lock()
+        if not self._cap.isOpened():
+            raise RuntimeError(f"[FrameGrabber] Cannot open camera: {device}")
 
-        self.latest_frame = None
-        self.latest_timestamp = 0.0
-        self.frame_count = 0
-        self.read_error_count = 0
-        self.started = False
+        self._frame      = None
+        self._lock       = threading.Lock()
+        self._last_time  = time.time()
+        self._running    = True
+        self._thread     = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        print("[FrameGrabber] Camera thread started.")
 
-    def open_camera(self):
-        cap = cv2.VideoCapture(self.device_index, cv2.CAP_V4L2)
+    def _run(self):
+        while self._running:
+            ret, frame = self._cap.read()
+            if ret and frame is not None:
+                with self._lock:
+                    self._frame     = frame
+                    self._last_time = time.time()
 
-        if not cap.isOpened():
-            raise RuntimeError(f"Could not open camera index {self.device_index}")
-
-        # Configure camera
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-        cap.set(cv2.CAP_PROP_FPS, self.fps)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-        # Optional: print negotiated settings for debug
-        actual_w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-        actual_h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-        actual_fps = cap.get(cv2.CAP_PROP_FPS)
-        print(f"[FrameGrabber] Camera opened: {actual_w}x{actual_h} @ {actual_fps:.2f} fps")
-
-        self.cap = cap
-
-    def start(self):
-        if self.started:
-            return
-
-        self.open_camera()
-        self.stop_event.clear()
-        self.thread = threading.Thread(target=self._reader_loop, name="FrameGrabber", daemon=True)
-        self.thread.start()
-        self.started = True
-        print("[FrameGrabber] Started")
-
-    def _reader_loop(self):
-        print("[FrameGrabber] Reader loop running")
-        while not self.stop_event.is_set():
-            try:
-                ret, frame = self.cap.read()
-            except Exception as e:
-                self.read_error_count += 1
-                print(f"[FrameGrabber] cap.read() exception: {e}")
-                time.sleep(0.1)
-                continue
-
-            if not ret or frame is None:
-                self.read_error_count += 1
-                print("[FrameGrabber] cap.read() returned no frame")
-                time.sleep(0.02)
-                continue
-
-            now = time.time()
-            with self.lock:
-                self.latest_frame = frame
-                self.latest_timestamp = now
-                self.frame_count += 1
-
-        print("[FrameGrabber] Reader loop exiting")
-
-    def get_latest_frame(self, copy=True):
-        with self.lock:
-            if self.latest_frame is None:
-                return None, 0.0
-            frame = self.latest_frame.copy() if copy else self.latest_frame
-            ts = self.latest_timestamp
-        return frame, ts
+    def get_latest_frame(self):
+        with self._lock:
+            return self._frame.copy() if self._frame is not None else None
 
     def age(self):
-        with self.lock:
-            ts = self.latest_timestamp
-        if ts == 0.0:
-            return float("inf")
-        return time.time() - ts
+        """Returns seconds since last successful frame grab."""
+        with self._lock:
+            return time.time() - self._last_time
 
-    def has_frame(self):
-        with self.lock:
-            return self.latest_frame is not None
+    def stop(self):
+        self._running = False
+        self._thread.join(timeout=2.0)
+        self._cap.release()
+        print("[FrameGrabber] Camera released.")
 
-    def stop(self, join_timeout=1.0):
-        print("[FrameGrabber] Stopping...")
-        self.stop_event.set()
 
-        if self.thread and self.thread.is_alive():
-            self.thread.join(timeout=join_timeout)
-            if self.thread.is_alive():
-                print("[FrameGrabber] Warning: reader thread did not exit (likely blocked in cap.read())")
+# ─────────────────────────────────────────────
+# BEE PLAYER — VLC state machine
+# ─────────────────────────────────────────────
 
-        if self.cap is not None:
-            try:
-                self.cap.release()
-                print("[FrameGrabber] Camera released")
-            except Exception as e:
-                print(f"[FrameGrabber] Error releasing camera: {e}")
-
-        self.started = False
-        
 class BeePlayer:
     """
-    State machine for playback:
-    - Always in one of: loop_centre / loop_left / loop_right
-    - Plays transition clips to change modes
-    - Main loop decides when to transition
-    - Main loop also polls VLC for transition completion
+    Two-state VLC controller:
+      IDLE    → loops idle.mp4
+      REACTING → plays a reaction video once, then returns to IDLE
     """
+    STATE_IDLE     = "IDLE"
+    STATE_REACTING = "REACTING"
 
-    def __init__(self, videos: dict):
-        self.instance = vlc.Instance(*VLC_ARGS)
-        self.player = self.instance.media_player_new()
+    def __init__(self, fullscreen: bool):
+        vlc_args = ["--no-video-title-show", "--quiet"]
+        if fullscreen:
+            vlc_args += ["--fullscreen"]
+        else:
+            vlc_args += ["--no-fullscreen", "--width=800", "--height=600"]
 
-        # Preload media objects for faster switches
-        # Add input-repeat=-1 ONLY to loop clips so they loop inside VLC
-        self.media = {}
-        for k, v in videos.items():
-            m = self.instance.media_new_path(v)
-            if k[1] == "loop":
-                m.add_option(":input-repeat=-1")
-            self.media[k] = m
+        self._instance = vlc.Instance(" ".join(vlc_args))
+        self._player   = self._instance.media_player_new()
+        self._state    = self.STATE_IDLE
+        self._fullscreen = fullscreen
 
-        self.lock = threading.Lock()
-        self.mode = "centre"          # current loop mode
-        self.busy = False             # True while a transition is playing
-        self.looping = True           # True while a loop clip is playing
-        self.next_mode = "centre"     # target mode after transition ends
-        self.desired_mode = "centre"  # requested mode from detection
+        if fullscreen:
+            self._player.set_fullscreen(True)
 
-        self._last_vlc_time = -1
-        self._last_vlc_progress_ts = time.time()
+        self._play_idle()
 
-    def start(self):
-        self._play_loop("centre")
+    def _make_media(self, path: Path):
+        return self._instance.media_new(str(path))
 
-    def set_desired_mode(self, mode: str):
-        with self.lock:
-            self.desired_mode = mode
+    def _play_idle(self):
+        media = self._make_media(VIDEO_IDLE)
+        media.add_option("input-repeat=65535")   # ~loop forever
+        self._player.set_media(media)
+        self._player.play()
+        self._state = self.STATE_IDLE
+        print("[BeePlayer] → IDLE loop")
 
-    def _play(self, key, looping: bool):
-        self.looping = looping
-        self.player.stop()
-        self.player.set_media(self.media[key])
-        self.player.play()
-
-        # Reset playback watchdog timing whenever media changes
-        self._last_vlc_time = -1
-        self._last_vlc_progress_ts = time.time()
-
-    def _play_loop(self, mode: str):
-        self.mode = mode
-        self.busy = False
-        self.next_mode = mode
-        self._play((mode, "loop"), looping=True)
-        print(f"[VLC] LOOP -> {mode}")
-
-    def transition_to(self, target_mode: str):
-        """
-        Requests a transition to target_mode.
-        If no direct transition exists (left->right), route via centre.
-        """
-        with self.lock:
-            if self.busy:
-                return
-            if target_mode == self.mode:
-                return
-
-            # direct transition exists?
-            if (self.mode, target_mode) in self.media:
-                self.busy = True
-                self.next_mode = target_mode
-                self._play((self.mode, target_mode), looping=False)
-                print(f"[VLC] TRANS -> {self.mode} to {target_mode}")
-                return
-
-            # route via centre if possible
-            if self.mode != "centre" and (self.mode, "centre") in self.media:
-                self.busy = True
-                self.next_mode = "centre"
-                self._play((self.mode, "centre"), looping=False)
-                print(f"[VLC] TRANS (route) -> {self.mode} to centre")
-                return
-
-            # hard fallback
-            print("[VLC] WARNING: Missing transition clip; forcing loop switch")
-            self._play_loop(target_mode)
+    def trigger_reaction(self):
+        """Called when motion is detected. Picks a random reaction video."""
+        chosen = random.choice([VIDEO_REACT_1, VIDEO_REACT_2])
+        media  = self._make_media(chosen)
+        self._player.set_media(media)
+        self._player.play()
+        self._state = self.STATE_REACTING
+        print(f"[BeePlayer] → REACTING  ({chosen.name})")
 
     def poll(self):
         """
-        Main-thread polling for transition completion.
-        Avoids doing playback control inside VLC callback threads.
+        Called every main loop cycle.
+        Detects end-of-reaction and transitions back to idle.
         """
-        if not self.busy:
-            return
+        if self._state == self.STATE_REACTING:
+            state = self._player.get_state()
+            if state in (vlc.State.Ended, vlc.State.Stopped, vlc.State.Error):
+                print("[BeePlayer] Reaction ended → returning to IDLE")
+                self._play_idle()
 
-        st = self.player.get_state()
-        if st in (vlc.State.Ended, vlc.State.Stopped, vlc.State.Error):
-            target = self.next_mode
-            print(f"[VLC] Transition complete -> {target}")
-            self._play_loop(target)
+    @property
+    def is_idle(self):
+        return self._state == self.STATE_IDLE
 
-    def ensure_playing(self):
-        """
-        Loop watchdog for kiosk installs:
-        - restart on bad states
-        - restart if playback time stops advancing
-        """
-        if self.busy:
-            return
+    def stop(self):
+        self._player.stop()
+        print("[BeePlayer] Stopped.")
 
-        if not self.looping:
-            return
 
-        st = self.player.get_state()
-        if st in (vlc.State.Ended, vlc.State.Stopped, vlc.State.Error, vlc.State.Paused):
-            print(f"\n[VLC] Watchdog restart (state={st})")
-            self.player.stop()
-            self.player.set_media(self.media[(self.mode, "loop")])
-            self.player.play()
-            self._last_vlc_time = -1
-            self._last_vlc_progress_ts = time.time()
-            return
+# ─────────────────────────────────────────────
+# MOTION DETECTOR
+# ─────────────────────────────────────────────
 
-        now = time.time()
-        t = self.player.get_time()
-        if t is None:
-            t = -1
-
-        if t != self._last_vlc_time:
-            self._last_vlc_time = t
-            self._last_vlc_progress_ts = now
-        else:
-            if (now - self._last_vlc_progress_ts) > 1.0:
-                print(f"\n[VLC] Watchdog restart (playback stalled at t={t}ms)")
-                self.player.stop()
-                self.player.set_media(self.media[(self.mode, "loop")])
-                self.player.play()
-                self._last_vlc_time = -1
-                self._last_vlc_progress_ts = now
-
-def compute_zone_from_mask(mask, zone_width, edge_pad):
+class MotionDetector:
     """
-    Compute an area-weighted centroid across foreground blobs
-    and return (zone, total_area, centroid_x)
+    MOG2-based motion detector.
+    Returns (motion_detected: bool, zone: str, debug_frame)
+    zone is one of: 'left', 'centre', 'right', or None
     """
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    total_area = 0.0
-    weighted_x_sum = 0.0
-
-    for c in contours:
-        a = cv2.contourArea(c)
-        if a < 40:
-            continue
-        x, y, w, h = cv2.boundingRect(c)
-        cx = x + (w / 2)
-        total_area += a
-        weighted_x_sum += cx * a
-
-    if total_area <= 0:
-        return None, 0, None
-
-    centroid_x = weighted_x_sum / total_area
-
-    left_trigger = zone_width - edge_pad
-    right_trigger = (zone_width * 2) + edge_pad
-
-    if centroid_x < left_trigger:
-        return "left", total_area, centroid_x
-    elif centroid_x > right_trigger:
-        return "right", total_area, centroid_x
-    else:
-        return "centre", total_area, centroid_x
-
-
-def main():
-    # Sanity check video files exist
-    for k, p in VIDEOS.items():
-        if not Path(p).exists():
-            raise FileNotFoundError(f"Missing video for {k}: {p}")
-
-    grabber = None
-    player = None
-
-    try:
-        # ---- Camera open ----
-        # ---- Camera open (threaded grabber) ----
-        grabber = FrameGrabber(device_index=CAM_INDEX, width=640, height=480, fps=30)
-        grabber.start()
-
-        print("[Main] Waiting for first camera frame...", flush=True)
-        startup_deadline = time.time() + 5.0
-
-        while not grabber.has_frame():
-            if time.time() > startup_deadline:
-                raise RuntimeError("Timed out waiting for first camera frame")
-
-            if SHOW_DEBUG_WINDOW or SHOW_MASK_WINDOW:
-                if (cv2.waitKey(1) & 0xFF) == ord("q"):
-                    return
-
-            time.sleep(0.01)
-
-        actual_w = grabber.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-        actual_h = grabber.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-        actual_fps = grabber.cap.get(cv2.CAP_PROP_FPS)
-        print(f"[CAM] requested=640x480@30, actual={actual_w:.0f}x{actual_h:.0f}@{actual_fps:.0f}", flush=True)
-
-        # ---- Background subtraction ----
-        bgs = cv2.createBackgroundSubtractorMOG2(
-            history=300,
-            varThreshold=32,
+    def __init__(self):
+        self._bg = cv2.createBackgroundSubtractorMOG2(
+            history=MOG2_HISTORY,
+            varThreshold=MOG2_THRESHOLD,
             detectShadows=False
         )
 
-        warmup_until = time.time() + 2.0
-        zone_width = DETECT_W // 3
-        edge_pad = int(zone_width * EDGE_PAD_RATIO)
+    def process(self, frame, debug_mode: bool):
+        h, w = frame.shape[:2]
+        dw   = int(w * DETECT_SCALE)
+        dh   = int(h * DETECT_SCALE)
+        small = cv2.resize(frame, (dw, dh))
 
-        # Presence and zone stability state
-        present = False
-        last_seen = 0.0
-        stable_zone = None
-        stable_count = 0
-        last_committed_zone = "centre"
+        mask  = self._bg.apply(small)
+        mask  = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
 
-        player = BeePlayer(VIDEOS)
-        player.start()
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        print("System running... Ctrl+C to stop.")
+        motion_detected = False
+        zone            = None
+        debug_frame     = frame.copy() if debug_mode else None
 
-        frame_count = 0
+        for cnt in cnts:
+            area = cv2.contourArea(cnt)
+            if area < MIN_AREA:
+                continue
 
+            motion_detected = True
+            M   = cv2.moments(cnt)
+            if M["m00"] > 0:
+                cx = M["m10"] / M["m00"]
+                cx_norm = cx / dw   # 0.0 → 1.0
+
+                if cx_norm < ZONE_LEFT_MAX:
+                    zone = "left"
+                elif cx_norm > ZONE_RIGHT_MIN:
+                    zone = "right"
+                else:
+                    zone = "centre"
+
+            # Debug overlay — scale contour back to full resolution
+            if debug_mode and debug_frame is not None:
+                scale_x = w / dw
+                scale_y = h / dh
+                cnt_scaled = (cnt * [scale_x, scale_y]).astype(int)
+                cv2.drawContours(debug_frame, [cnt_scaled], -1, (0, 255, 0), 2)
+
+        if debug_mode and debug_frame is not None:
+            # Zone divider lines
+            cv2.line(debug_frame, (int(w * ZONE_LEFT_MAX), 0),
+                     (int(w * ZONE_LEFT_MAX), h), (255, 100, 0), 1)
+            cv2.line(debug_frame, (int(w * ZONE_RIGHT_MIN), 0),
+                     (int(w * ZONE_RIGHT_MIN), h), (255, 100, 0), 1)
+
+            # Status text
+            label = f"MOTION: {zone}" if motion_detected else "idle"
+            cv2.putText(debug_frame, label, (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                        (0, 255, 100) if motion_detected else (180, 180, 180), 2)
+
+        return motion_detected, zone, debug_frame
+
+
+# ─────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────
+
+def main():
+    debug_mode = args.debug   # mutable via runtime toggle
+
+    print("=" * 50)
+    print("  🐝 Bee Motion Video System")
+    print(f"  Mode    : {'DEBUG' if debug_mode else 'KIOSK'}")
+    print(f"  Idle    : {VIDEO_IDLE.name}")
+    print(f"  React 1 : {VIDEO_REACT_1.name}")
+    print(f"  React 2 : {VIDEO_REACT_2.name}")
+    print("  Press D to toggle debug | Ctrl+C to quit")
+    print("=" * 50)
+
+    grabber  = FrameGrabber(CAMERA_DEVICE, CAPTURE_WIDTH, CAPTURE_HEIGHT)
+    player   = BeePlayer(fullscreen=not debug_mode)
+    detector = MotionDetector()
+
+    last_motion_time = 0.0
+    frame_count      = 0
+
+    try:
         while True:
-            frame_count += 1
+            # ── Camera health watchdog ──────────────────
+            if grabber.age() > FRAME_STALE_LIMIT:
+                print(f"[WARN] Camera stale for {grabber.age():.1f}s")
 
-            frame, frame_ts = grabber.get_latest_frame(copy=True)
-            frame_age = grabber.age()
-
-            if frame_count % 30 == 0:
-                print(f"\n[FRAME] age={frame_age:.3f}s shape={None if frame is None else frame.shape}", flush=True)
-
+            frame = grabber.get_latest_frame()
             if frame is None:
-                player.ensure_playing()
-
-                if SHOW_DEBUG_WINDOW or SHOW_MASK_WINDOW:
-                    if (cv2.waitKey(1) & 0xFF) == ord("q"):
-                        break
-
-                time.sleep(0.02)
+                time.sleep(0.1)
                 continue
 
-            if frame_age > CAMERA_STALE_SECONDS:
-                print(f"\n[CAM] WARNING: stale frame age={frame_age:.2f}s", flush=True)
+            # ── Motion detection ────────────────────────
+            motion, zone, dbg_frame = detector.process(frame, debug_mode)
 
-                player.ensure_playing()
-
-                if SHOW_DEBUG_WINDOW:
-                    dbg = frame.copy()
-                    cv2.putText(
-                        dbg,
-                        f"CAMERA STALLED age={frame_age:.1f}s",
-                        (10, 25),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
-                        (0, 0, 255),
-                        2,
-                    )
-                    cv2.imshow("Bee Debug", dbg)
-
-                if SHOW_MASK_WINDOW:
-                    stale_mask = cv2.resize(frame, (DETECT_W, DETECT_H))
-                    stale_mask = cv2.cvtColor(stale_mask, cv2.COLOR_BGR2GRAY)
-                    cv2.putText(
-                        stale_mask,
-                        f"STALE {frame_age:.1f}s",
-                        (10, 25),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        255,
-                        2,
-                    )
-                    cv2.imshow("Motion Mask", stale_mask)
-
-                if SHOW_DEBUG_WINDOW or SHOW_MASK_WINDOW:
-                    if (cv2.waitKey(1) & 0xFF) == ord("q"):
-                        break
-
-                time.sleep(0.05)
-                continue
-
-            # Downscale for detection
-            small = cv2.resize(frame, (DETECT_W, DETECT_H))
-            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-            fg = bgs.apply(gray)
-            
-            # ---- WARMUP: still pump OpenCV windows so they stay live ----
-            if time.time() < warmup_until:
-                if SHOW_DEBUG_WINDOW:
-                    cv2.imshow("Bee Debug", frame)
-                if SHOW_MASK_WINDOW:
-                    cv2.imshow("Motion Mask", fg)
-
-                if SHOW_DEBUG_WINDOW or SHOW_MASK_WINDOW:
-                    if (cv2.waitKey(1) & 0xFF) == ord("q"):
-                        return  # exit main cleanly during warmup
-
-                continue
-
-
-            # Mask cleanup
-            fg = cv2.GaussianBlur(fg, (5, 5), 0)
-            _, fg = cv2.threshold(fg, 128, 255, cv2.THRESH_BINARY)
-            fg = cv2.dilate(fg, None, iterations=2)
-            fg = cv2.erode(fg, None, iterations=1)
-
-            zone, area, cx = compute_zone_from_mask(fg, zone_width, edge_pad)
-            nz = cv2.countNonZero(fg)
-
-            present_now = (zone is not None and area >= PRESENCE_AREA)
-
-            # SSH-friendly status line
-            print(f"zone={zone} area={area:.0f} nz={nz} present={present_now} cx={cx}",
-                  end="\r", flush=True)
-
-            # Heartbeat (prints as a new line occasionally so you can tell it’s alive)
-            if frame_count % HEARTBEAT_EVERY_N == 0:
-                print(f"\n[HB] frames={frame_count} present_now={present_now} area={area:.0f} nz={nz} zone={zone}",
-                      flush=True)
-
+            # ── State machine ───────────────────────────
             now = time.time()
-            if present_now:
-                last_seen = now
+            cooldown_active = (now - last_motion_time) < MOTION_COOLDOWN
 
-            present = (now - last_seen) < PRESENCE_HOLD
+            if motion and player.is_idle and not cooldown_active:
+                player.trigger_reaction()
+                last_motion_time = now
 
-            # Desired mode logic
-            if not present:
-                player.set_desired_mode("centre")
-                stable_zone = None
-                stable_count = 0
-                last_committed_zone = "centre"
+            player.poll()   # check if reaction ended → back to idle
 
-                if player.mode != "centre" and not player.busy:
-                    player.transition_to("centre")
-            else:
-                # stabilize zone to avoid jitter
-                if zone is not None:
-                    if zone == stable_zone:
-                        stable_count += 1
-                    else:
-                        stable_zone = zone
-                        stable_count = 1
+            # ── Debug windows ───────────────────────────
+            if debug_mode and dbg_frame is not None:
+                cv2.imshow("Bee Debug — press D to toggle", dbg_frame)
 
-                    if stable_count >= ZONE_STABLE_FRAMES:
-                        player.set_desired_mode(stable_zone)
+            # ── Key handling ────────────────────────────
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('d') or key == ord('D'):
+                debug_mode = not debug_mode
+                print(f"[DEBUG] Mode toggled → {'ON' if debug_mode else 'OFF'}")
+                if not debug_mode:
+                    cv2.destroyAllWindows()
 
-                        if stable_zone != last_committed_zone and not player.busy:
-                            player.transition_to(stable_zone)
-                            last_committed_zone = stable_zone
+            elif key == ord('q') or key == 27:   # Q or ESC
+                print("[QUIT] User requested exit.")
+                break
 
-            # Poll VLC transition completion from the main thread
-            player.poll()
+            frame_count += 1
+            if frame_count % 150 == 0:
+                print(f"[HEARTBEAT] frames={frame_count} "
+                      f"cam_age={grabber.age():.2f}s "
+                      f"player={player._state} "
+                      f"debug={'ON' if debug_mode else 'OFF'}")
 
-            # Catch-up desired mode after transition ends
-            if not player.busy:
-                desired = player.desired_mode
-                if desired != player.mode:
-                    player.transition_to(desired)
-
-            # VLC watchdog
-            player.ensure_playing()
-
-            # ---- Debug visuals (only if enabled) ----
-            if SHOW_DEBUG_WINDOW:
-                dbg = frame.copy()
-                cv2.putText(dbg, f"zone={zone} present={present}", (10, 25),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                cv2.putText(dbg, f"area={area:.0f} nz={nz} cx={cx}", (10, 55),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                cv2.imshow("Bee Debug", dbg)
-
-            if SHOW_MASK_WINDOW:
-                cv2.imshow("Motion Mask", fg)
-
-            if SHOW_DEBUG_WINDOW or SHOW_MASK_WINDOW:
-                # allow 'q' to quit cleanly
-
-                if (cv2.waitKey(1) & 0xFF) == ord("q"):
-                    break
+            time.sleep(MAIN_LOOP_SLEEP)
 
     except KeyboardInterrupt:
-        print("\n[INFO] Ctrl+C received, shutting down...", flush=True)
+        print("\n[SHUTDOWN] Ctrl+C received.")
 
     finally:
-        print("[CLEANUP] starting", flush=True)
+        print("[CLEANUP] Stopping player and camera...")
+        player.stop()
+        grabber.stop()
+        cv2.destroyAllWindows()
+        print("[CLEANUP] Done. Goodbye. 🐝")
 
-        try:
-            if player is not None:
-                print("[CLEANUP] stopping VLC player", flush=True)
-                try:
-                    player.player.stop()
-                    print("[CLEANUP] VLC player stopped", flush=True)
-                except Exception as e:
-                    print(f"[CLEANUP] VLC stop error: {e}", flush=True)
-        except Exception as e:
-            print(f"[CLEANUP] outer VLC cleanup error: {e}", flush=True)
-
-        try:
-            if grabber is not None:
-                print("[CLEANUP] stopping grabber", flush=True)
-                grabber.stop()
-                print("[CLEANUP] grabber stopped", flush=True)
-        except Exception as e:
-            print(f"[CLEANUP] grabber cleanup error: {e}", flush=True)
-
-        try:
-            print("[CLEANUP] destroying windows", flush=True)
-            cv2.destroyAllWindows()
-            print("[CLEANUP] windows destroyed", flush=True)
-        except Exception as e:
-            print(f"[CLEANUP] destroyAllWindows error: {e}", flush=True)
-
-        print("[CLEANUP] done", flush=True)
 
 if __name__ == "__main__":
     main()
