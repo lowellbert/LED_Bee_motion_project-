@@ -128,11 +128,11 @@ class BeePlayer:
     STATE_REACTING = "REACTING"
 
     def __init__(self, fullscreen: bool):
-        vlc_args = ["--no-video-title-show", "--quiet"]
+        vlc_args = ["--no-video-title-show", "--quiet", "--no-xlib"]
         if fullscreen:
-            vlc_args += ["--fullscreen"]
+            vlc_args += ["--fullscreen", "--video-on-top"]
         else:
-            vlc_args += ["--no-fullscreen", "--width=800", "--height=600"]
+            vlc_args += ["--no-fullscreen", "--width=800", "--height=600", "--video-on-top"]
 
         self._instance = vlc.Instance(" ".join(vlc_args))
         self._player   = self._instance.media_player_new()
@@ -263,6 +263,10 @@ class MotionDetector:
 # ─────────────────────────────────────────────
 
 def main():
+    import os
+    os.environ.setdefault("DISPLAY", ":0")
+    os.environ.setdefault("XAUTHORITY", "/home/beedisplay/.Xauthority")
+    cv2.startWindowThread()
     debug_mode = args.debug   # mutable via runtime toggle
 
     print("=" * 50)
