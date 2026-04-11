@@ -19,7 +19,12 @@ import threading
 import random
 import argparse
 import sys
+import os
 from pathlib import Path
+
+# ── Force display environment for SSH + local HDMI use ──────────────────────
+os.environ.setdefault("DISPLAY", ":0")
+os.environ.setdefault("XAUTHORITY", "/home/beedisplay/.Xauthority")
 
 # ─────────────────────────────────────────────
 # CONFIG — edit paths and tuning values here
@@ -41,8 +46,8 @@ FRAME_STALE_LIMIT = 3.0       # Seconds before camera is considered stalled
 MAIN_LOOP_SLEEP   = 0.033     # ~30 Hz main loop target
 
 # Zone boundaries (as fraction of frame width)
-ZONE_LEFT_MAX   = 0.33
-ZONE_RIGHT_MIN  = 0.67
+ZONE_LEFT_MAX  = 0.33
+ZONE_RIGHT_MIN = 0.67
 
 # ─────────────────────────────────────────────
 # ARGUMENT PARSING
@@ -82,11 +87,11 @@ class FrameGrabber:
         if not self._cap.isOpened():
             raise RuntimeError(f"[FrameGrabber] Cannot open camera: {device}")
 
-        self._frame      = None
-        self._lock       = threading.Lock()
-        self._last_time  = time.time()
-        self._running    = True
-        self._thread     = threading.Thread(target=self._run, daemon=True)
+        self._frame     = None
+        self._lock      = threading.Lock()
+        self._last_time = time.time()
+        self._running   = True
+        self._thread    = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         print("[FrameGrabber] Camera thread started.")
 
@@ -121,22 +126,34 @@ class FrameGrabber:
 class BeePlayer:
     """
     Two-state VLC controller:
-      IDLE    → loops idle.mp4
-      REACTING → plays a reaction video once, then returns to IDLE
+      IDLE      -> loops idle.mp4
+      REACTING  -> plays a reaction video once, then returns to IDLE
     """
     STATE_IDLE     = "IDLE"
     STATE_REACTING = "REACTING"
 
     def __init__(self, fullscreen: bool):
-        vlc_args = ["--no-video-title-show", "--quiet", "--no-xlib"]
+        vlc_args = [
+            "--no-video-title-show",
+            "--quiet",
+            "--no-xlib",                    # prevents X threading conflicts on Pi
+        ]
         if fullscreen:
-            vlc_args += ["--fullscreen", "--video-on-top"]
+            vlc_args += [
+                "--fullscreen",
+                "--video-on-top",           # forces VLC window to front of display
+            ]
         else:
-            vlc_args += ["--no-fullscreen", "--width=800", "--height=600", "--video-on-top"]
+            vlc_args += [
+                "--no-fullscreen",
+                "--width=800",
+                "--height=600",
+                "--video-on-top",           # keeps VLC visible next to CV2 debug window
+            ]
 
-        self._instance = vlc.Instance(" ".join(vlc_args))
-        self._player   = self._instance.media_player_new()
-        self._state    = self.STATE_IDLE
+        self._instance   = vlc.Instance(" ".join(vlc_args))
+        self._player     = self._instance.media_player_new()
+        self._state      = self.STATE_IDLE
         self._fullscreen = fullscreen
 
         if fullscreen:
@@ -149,11 +166,11 @@ class BeePlayer:
 
     def _play_idle(self):
         media = self._make_media(VIDEO_IDLE)
-        media.add_option("input-repeat=65535")   # ~loop forever
+        media.add_option("input-repeat=65535")   # loop effectively forever
         self._player.set_media(media)
         self._player.play()
         self._state = self.STATE_IDLE
-        print("[BeePlayer] → IDLE loop")
+        print("[BeePlayer] -> IDLE loop")
 
     def trigger_reaction(self):
         """Called when motion is detected. Picks a random reaction video."""
@@ -162,7 +179,7 @@ class BeePlayer:
         self._player.set_media(media)
         self._player.play()
         self._state = self.STATE_REACTING
-        print(f"[BeePlayer] → REACTING  ({chosen.name})")
+        print(f"[BeePlayer] -> REACTING  ({chosen.name})")
 
     def poll(self):
         """
@@ -172,7 +189,7 @@ class BeePlayer:
         if self._state == self.STATE_REACTING:
             state = self._player.get_state()
             if state in (vlc.State.Ended, vlc.State.Stopped, vlc.State.Error):
-                print("[BeePlayer] Reaction ended → returning to IDLE")
+                print("[BeePlayer] Reaction ended -> returning to IDLE")
                 self._play_idle()
 
     @property
@@ -202,13 +219,13 @@ class MotionDetector:
         )
 
     def process(self, frame, debug_mode: bool):
-        h, w = frame.shape[:2]
-        dw   = int(w * DETECT_SCALE)
-        dh   = int(h * DETECT_SCALE)
-        small = cv2.resize(frame, (dw, dh))
+        h, w    = frame.shape[:2]
+        dw      = int(w * DETECT_SCALE)
+        dh      = int(h * DETECT_SCALE)
+        small   = cv2.resize(frame, (dw, dh))
 
-        mask  = self._bg.apply(small)
-        mask  = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
+        mask    = self._bg.apply(small)
+        mask    = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
                     cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
 
         cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -223,10 +240,10 @@ class MotionDetector:
                 continue
 
             motion_detected = True
-            M   = cv2.moments(cnt)
+            M = cv2.moments(cnt)
             if M["m00"] > 0:
-                cx = M["m10"] / M["m00"]
-                cx_norm = cx / dw   # 0.0 → 1.0
+                cx      = M["m10"] / M["m00"]
+                cx_norm = cx / dw   # normalised 0.0 to 1.0
 
                 if cx_norm < ZONE_LEFT_MAX:
                     zone = "left"
@@ -235,25 +252,30 @@ class MotionDetector:
                 else:
                     zone = "centre"
 
-            # Debug overlay — scale contour back to full resolution
+            # Scale contour back to full resolution for overlay
             if debug_mode and debug_frame is not None:
-                scale_x = w / dw
-                scale_y = h / dh
+                scale_x    = w / dw
+                scale_y    = h / dh
                 cnt_scaled = (cnt * [scale_x, scale_y]).astype(int)
                 cv2.drawContours(debug_frame, [cnt_scaled], -1, (0, 255, 0), 2)
 
         if debug_mode and debug_frame is not None:
-            # Zone divider lines
-            cv2.line(debug_frame, (int(w * ZONE_LEFT_MAX), 0),
-                     (int(w * ZONE_LEFT_MAX), h), (255, 100, 0), 1)
-            cv2.line(debug_frame, (int(w * ZONE_RIGHT_MIN), 0),
-                     (int(w * ZONE_RIGHT_MIN), h), (255, 100, 0), 1)
+            # Draw zone divider lines on full-res frame
+            cv2.line(debug_frame,
+                     (int(w * ZONE_LEFT_MAX), 0),
+                     (int(w * ZONE_LEFT_MAX), h),
+                     (255, 100, 0), 1)
+            cv2.line(debug_frame,
+                     (int(w * ZONE_RIGHT_MIN), 0),
+                     (int(w * ZONE_RIGHT_MIN), h),
+                     (255, 100, 0), 1)
 
-            # Status text
+            # Status label
             label = f"MOTION: {zone}" if motion_detected else "idle"
-            cv2.putText(debug_frame, label, (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8,
-                        (0, 255, 100) if motion_detected else (180, 180, 180), 2)
+            color = (0, 255, 100) if motion_detected else (180, 180, 180)
+            cv2.putText(debug_frame, label,
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8, color, 2)
 
         return motion_detected, zone, debug_frame
 
@@ -263,62 +285,82 @@ class MotionDetector:
 # ─────────────────────────────────────────────
 
 def main():
-    import os
-    os.environ.setdefault("DISPLAY", ":0")
-    os.environ.setdefault("XAUTHORITY", "/home/beedisplay/.Xauthority")
-    cv2.startWindowThread()
-    debug_mode = args.debug   # mutable via runtime toggle
+    cv2.startWindowThread()   # required on Pi for CV2 GUI event loop
+    debug_mode = args.debug
 
-    print("=" * 50)
-    print("  🐝 Bee Motion Video System")
+    print("=" * 52)
+    print("  Bee Motion Video System")
     print(f"  Mode    : {'DEBUG' if debug_mode else 'KIOSK'}")
     print(f"  Idle    : {VIDEO_IDLE.name}")
     print(f"  React 1 : {VIDEO_REACT_1.name}")
     print(f"  React 2 : {VIDEO_REACT_2.name}")
     print("  Press D to toggle debug | Ctrl+C to quit")
-    print("=" * 50)
+    print("=" * 52)
 
-    grabber  = FrameGrabber(CAMERA_DEVICE, CAPTURE_WIDTH, CAPTURE_HEIGHT)
+    grabber = FrameGrabber(CAMERA_DEVICE, CAPTURE_WIDTH, CAPTURE_HEIGHT)
+
+    # ── Wait for camera to produce first valid frame ─────────────────────────
+    print("[INIT] Waiting for camera warm-up...")
+    warmup_start = time.time()
+    while grabber.get_latest_frame() is None:
+        time.sleep(0.05)
+        if time.time() - warmup_start > 5.0:
+            print("[ERROR] Camera failed to produce a frame after 5s - check /dev/video0")
+            grabber.stop()
+            sys.exit(1)
+    elapsed = time.time() - warmup_start
+    print(f"[INIT] Camera ready in {elapsed:.2f}s - OK")
+
     player   = BeePlayer(fullscreen=not debug_mode)
     detector = MotionDetector()
 
     last_motion_time = 0.0
     frame_count      = 0
 
+    # Pre-create the named debug window once so it doesn't flicker
+    if debug_mode:
+        cv2.namedWindow("Bee Debug — press D to toggle", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Bee Debug — press D to toggle", 640, 480)
+
     try:
         while True:
-            # ── Camera health watchdog ──────────────────
-            if grabber.age() > FRAME_STALE_LIMIT:
-                print(f"[WARN] Camera stale for {grabber.age():.1f}s")
+            # ── Camera health watchdog ────────────────────────────────────────
+            cam_age = grabber.age()
+            if cam_age > FRAME_STALE_LIMIT:
+                print(f"[WARN] Camera stale for {cam_age:.1f}s")
 
             frame = grabber.get_latest_frame()
             if frame is None:
                 time.sleep(0.1)
                 continue
 
-            # ── Motion detection ────────────────────────
+            # ── Motion detection ──────────────────────────────────────────────
             motion, zone, dbg_frame = detector.process(frame, debug_mode)
 
-            # ── State machine ───────────────────────────
-            now = time.time()
+            # ── State machine ─────────────────────────────────────────────────
+            now             = time.time()
             cooldown_active = (now - last_motion_time) < MOTION_COOLDOWN
 
             if motion and player.is_idle and not cooldown_active:
                 player.trigger_reaction()
                 last_motion_time = now
 
-            player.poll()   # check if reaction ended → back to idle
+            player.poll()   # check if reaction ended -> back to idle
 
-            # ── Debug windows ───────────────────────────
+            # ── Debug window ──────────────────────────────────────────────────
             if debug_mode and dbg_frame is not None:
                 cv2.imshow("Bee Debug — press D to toggle", dbg_frame)
 
-            # ── Key handling ────────────────────────────
+            # ── Key handling ──────────────────────────────────────────────────
             key = cv2.waitKey(1) & 0xFF
+
             if key == ord('d') or key == ord('D'):
                 debug_mode = not debug_mode
-                print(f"[DEBUG] Mode toggled → {'ON' if debug_mode else 'OFF'}")
-                if not debug_mode:
+                print(f"[DEBUG] Mode toggled -> {'ON' if debug_mode else 'OFF'}")
+                if debug_mode:
+                    cv2.namedWindow("Bee Debug — press D to toggle", cv2.WINDOW_NORMAL)
+                    cv2.resizeWindow("Bee Debug — press D to toggle", 640, 480)
+                else:
                     cv2.destroyAllWindows()
 
             elif key == ord('q') or key == 27:   # Q or ESC
@@ -342,7 +384,7 @@ def main():
         player.stop()
         grabber.stop()
         cv2.destroyAllWindows()
-        print("[CLEANUP] Done. Goodbye. 🐝")
+        print("[CLEANUP] Done. Goodbye.")
 
 
 if __name__ == "__main__":
