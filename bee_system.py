@@ -129,52 +129,35 @@ class FrameGrabber:
 
     def _run(self):
         """
-        Uses select() to wait on the V4L2 file descriptor before reading.
-        This is the OS-correct way to pace camera reads on Linux:
-          - cap.read() is only called when the kernel signals a frame is ready
-          - A minimum interval gate (1/15s) prevents reading faster than needed
-          - No busy-spinning between frames
+        Paced capture loop using grab()/retrieve() split.
+        grab() is cheap — it just marks the next frame without decoding.
+        We call grab() in a tight loop to drain the V4L2 buffer, then
+        retrieve() only once per interval to actually decode the frame.
+        This prevents the buffer backlog that causes cap.read() to spin.
         """
-        target_interval = 1.0 / 15.0   # camera hardware minimum is 15fps
-        last_grab       = 0.0
-
-        # Try to get the underlying V4L2 file descriptor for select()
-        fd = -1
-        if hasattr(cv2, "CAP_PROP_VIDEO_CAPTURE_FD"):
-            fd = int(self._cap.get(cv2.CAP_PROP_VIDEO_CAPTURE_FD))
-        use_select = fd > 0
-
-        if use_select:
-            print(f"[FrameGrabber] Using select() on fd={fd}")
-        else:
-            print("[FrameGrabber] select() not available — using interval sleep pacing")
-
+        target_interval = 1.0 / 15.0
         while self._running:
-            now        = time.time()
-            since_last = now - last_grab
+            # Sleep first — let the camera accumulate exactly one frame
+            time.sleep(target_interval)
 
-            # Enforce minimum interval — never read faster than 15fps
-            if since_last < target_interval:
-                time.sleep(target_interval - since_last)
-                continue
+            # Drain any stale buffered frames — grab without decoding
+            # This clears the internal buffer so retrieve() gets the LATEST frame
+            drained = 0
+            while True:
+                grabbed = self._cap.grab()
+                if not grabbed:
+                    break
+                drained += 1
+                # Stop after clearing up to 5 stale frames
+                if drained >= 5:
+                    break
 
-            # Wait for kernel to signal frame ready (up to 200ms timeout)
-            if use_select:
-                ready, _, _ = select.select([fd], [], [], 0.2)
-                if not ready:
-                    # Timeout — no frame from kernel yet, loop back
-                    continue
-
-            ret, frame = self._cap.read()
-            last_grab  = time.time()
-
+            # Now decode only the most recent frame
+            ret, frame = self._cap.retrieve()
             if ret and frame is not None:
                 with self._lock:
                     self._frame     = frame
                     self._last_time = time.time()
-            else:
-                # Failed read — short sleep to avoid tight error loop
-                time.sleep(0.05)
 
     def get_latest_frame(self):
         with self._lock:
