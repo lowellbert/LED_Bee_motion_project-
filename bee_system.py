@@ -35,12 +35,12 @@ VIDEO_REACT_1 = Path("/home/beedisplay/projects/LED_Bee_motion_project-/videos/r
 VIDEO_REACT_2 = Path("/home/beedisplay/projects/LED_Bee_motion_project-/videos/react_2.mp4")
 
 CAMERA_DEVICE     = "/dev/video0"
-CAPTURE_WIDTH     = 640
-CAPTURE_HEIGHT    = 480
+CAPTURE_WIDTH     = 320
+CAPTURE_HEIGHT    = 240
 DETECT_SCALE      = 0.25      # Downscale factor for motion detection (perf)
 DETECT_INTERVAL   = 0.10      # run motion detection at 10fps max, not 30fps
-MOG2_HISTORY      = 500
-MOG2_THRESHOLD    = 50
+MOG2_HISTORY      = 200
+MOG2_THRESHOLD    = 40
 MIN_AREA          = 1500      # Minimum contour area to count as real motion
 MOTION_COOLDOWN   = 3.0       # Seconds to ignore motion after a reaction starts
 FRAME_STALE_LIMIT = 3.0       # Seconds before camera is considered stalled
@@ -82,8 +82,17 @@ class FrameGrabber:
     def __init__(self, device, width, height):
         self._cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
-        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)  
+        self._cap.set(cv2.CAP_PROP_FPS, 10)          # ← cap camera at 10fps at hardware level
         self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+
+        # Confirm actual FPS set
+        actual_fps = self._cap.get(cv2.CAP_PROP_FPS)
+        print(f"[FrameGrabber] Capture FPS set to: {actual_fps}")
+
+
+        
 
         if not self._cap.isOpened():
             raise RuntimeError(f"[FrameGrabber] Cannot open camera: {device}")
@@ -97,12 +106,20 @@ class FrameGrabber:
         print("[FrameGrabber] Camera thread started.")
 
     def _run(self):
+        target_interval = 1.0 / 10.0   # 10fps max — matches DETECT_INTERVAL
         while self._running:
+            t0 = time.time()
             ret, frame = self._cap.read()
             if ret and frame is not None:
                 with self._lock:
                     self._frame     = frame
                     self._last_time = time.time()
+            # Sleep for remainder of target interval to avoid busy-spinning
+            elapsed = time.time() - t0
+            remaining = target_interval - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
+
 
     def get_latest_frame(self):
         with self._lock:
