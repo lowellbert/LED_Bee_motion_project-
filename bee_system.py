@@ -44,10 +44,10 @@ CAPTURE_WIDTH     = 320        # detection resolution width
 CAPTURE_HEIGHT    = 240        # detection resolution height
 DETECT_SCALE      = 0.5        # 0.5 on 320x240 = 160x120 detection image
 DETECT_INTERVAL   = 0.10       # run motion detection at 10fps max
-MOG2_HISTORY      = 200        # faster background model adaptation
-MOG2_THRESHOLD    = 40         # foreground sensitivity
-MIN_AREA          = 800        # minimum contour area (adjusted for lower res)
-MOTION_COOLDOWN   = 3.0        # seconds to ignore new motion after reaction starts
+MOG2_HISTORY      = 300        # faster background model adaptation
+MOG2_THRESHOLD    = 25         # foreground sensitivity
+MIN_AREA          = 300        # minimum contour area (adjusted for lower res)
+MOTION_COOLDOWN   = 2.0        # seconds to ignore new motion after reaction starts
 FRAME_STALE_LIMIT = 3.0        # seconds before camera is considered stalled
 MAIN_LOOP_SLEEP   = 0.10       # 10Hz main loop in kiosk mode
 DEBUG_LOOP_SLEEP  = 0.033      # ~30Hz in debug mode for responsive preview
@@ -354,6 +354,17 @@ class MotionDetector:
 
 def main():
     cv2.startWindowThread()
+
+    # ── OS-level performance tuning ──────────────────────────────────────────
+    import psutil
+    try:
+        proc = psutil.Process()
+        # Lower overall process priority — VLC GPU decode gets CPU preference
+        proc.nice(5)
+        print(f"[INIT] Process nice level set to 5")
+    except Exception as e:
+        print(f"[INIT] Could not set nice level: {e}")
+
     debug_mode = args.debug
 
     print("=" * 54)
