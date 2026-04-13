@@ -26,6 +26,48 @@ import argparse
 import sys
 import os
 from pathlib import Path
+import signal
+import termios, tty
+
+class KeyListener:
+    """
+    Listens for a single keypress in the terminal (works in kiosk mode).
+    Press Q or ESC in the terminal window to request shutdown.
+    """
+    def __init__(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        global _shutdown_requested
+        try:
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            tty.setraw(fd)
+            while not _shutdown_requested:
+                ch = sys.stdin.read(1)
+                if ch in ('\x1b', 'q', 'Q'):   # ESC or Q
+                    print("\n[QUIT] Keypress detected — shutting down...")
+                    _shutdown_requested = True
+                    break
+        except Exception:
+            pass
+        finally:
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            except Exception:
+                pass
+
+# Allow clean shutdown via pkill or desktop Stop icon
+_shutdown_requested = False
+
+def _handle_signal(signum, frame):
+    global _shutdown_requested
+    print(f"\n[SHUTDOWN] Signal {signum} received — shutting down...")
+    _shutdown_requested = True
+
+signal.signal(signal.SIGTERM, _handle_signal)
+signal.signal(signal.SIGINT,  _handle_signal)
 
 # -- Force display environment for SSH + local HDMI use ----------------------
 os.environ.setdefault("DISPLAY", ":0")
@@ -204,6 +246,8 @@ class BeePlayer:
             "--avcodec-hw=any",     # fallback: use any available hardware decode
             "--file-caching=300",   # small file cache -- videos are local
             "--no-audio",           # no audio decode overhead
+            "--mouse-hide-timeout=3000", # ← hide cursor after 3s of inactivity
+		
         ]
         if fullscreen:
             vlc_args += [
@@ -354,6 +398,7 @@ class MotionDetector:
 
 def main():
     cv2.startWindowThread()
+    key_listener = KeyListener()   # ← ADD — enables Q/ESC in terminal
 
     # ── OS-level performance tuning ──────────────────────────────────────────
     import psutil
@@ -407,7 +452,7 @@ def main():
         cv2.resizeWindow("Bee Debug - press D to toggle", 640, 480)
 
     try:
-        while True:
+        while not _shutdown_requested:
             # camera health watchdog
             cam_age = grabber.age()
             if cam_age > FRAME_STALE_LIMIT:
