@@ -27,36 +27,6 @@ import sys
 import os
 from pathlib import Path
 import signal
-import termios, tty
-
-class KeyListener:
-    """
-    Listens for a single keypress in the terminal (works in kiosk mode).
-    Press Q or ESC in the terminal window to request shutdown.
-    """
-    def __init__(self):
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def _run(self):
-        global _shutdown_requested
-        try:
-            fd = sys.stdin.fileno()
-            old = termios.tcgetattr(fd)
-            tty.setraw(fd)
-            while not _shutdown_requested:
-                ch = sys.stdin.read(1)
-                if ch in ('\x1b', 'q', 'Q'):   # ESC or Q
-                    print("\n[QUIT] Keypress detected — shutting down...")
-                    _shutdown_requested = True
-                    break
-        except Exception:
-            pass
-        finally:
-            try:
-                termios.tcsetattr(fd, termios.TCSADRAIN, old)
-            except Exception:
-                pass
 
 # Allow clean shutdown via pkill or desktop Stop icon
 _shutdown_requested = False
@@ -398,17 +368,6 @@ class MotionDetector:
 
 def main():
     cv2.startWindowThread()
-    key_listener = KeyListener()   # ← ADD — enables Q/ESC in terminal
-
-    # ── OS-level performance tuning ──────────────────────────────────────────
-    import psutil
-    try:
-        proc = psutil.Process()
-        # Lower overall process priority — VLC GPU decode gets CPU preference
-        proc.nice(5)
-        print(f"[INIT] Process nice level set to 5")
-    except Exception as e:
-        print(f"[INIT] Could not set nice level: {e}")
 
     debug_mode = args.debug
 
