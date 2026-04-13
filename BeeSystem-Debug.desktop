@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Bee System — Debug
+Comment=Launch Bee Motion Video System in Debug Mode
+Exec=bash -c "cd /home/beedisplay/projects/LED_Bee_motion_project- && source .venv/bin/activate && nice -n 10 python3 -u bee_system.py --debug"
+Icon=preferences-system
+Terminal=true
+Categories=Application;

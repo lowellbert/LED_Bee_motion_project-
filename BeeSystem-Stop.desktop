@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Bee System — Stop
+Comment=Stop the Bee Motion Video System
+Exec=bash -c "pkill -f bee_system.py && echo 'Bee System stopped.' && sleep 2"
+Icon=media-playback-stop
+Terminal=true
+Categories=Application;
