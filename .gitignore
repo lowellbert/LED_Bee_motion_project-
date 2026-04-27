@@ -16,3 +16,4 @@ venv/
 .vscode/
 .idea/
 .DS_Store
+bee_system_pi4_backup.py
