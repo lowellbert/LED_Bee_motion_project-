@@ -1,10 +1,6 @@
 # Bee Motion Video Kiosk — Python Dependencies
-# Install with: pip install -r requirements.txt
-# Note: opencv-python is installed via apt (python3-opencv)
-# as the pip version does not include V4L2 support on Pi.
+# opencv and numpy are installed via apt (system packages)
+# picamera2 is installed via apt
 
 # Video playback
 python-vlc==3.0.21203
-
-# Utilities
-numpy==2.2.4
