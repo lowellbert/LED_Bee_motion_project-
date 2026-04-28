@@ -1,9 +1,9 @@
 [Desktop Entry]
 Version=1.0
 Type=Application
-Name=Bee System — Run
-Comment=Launch Bee Motion Video Kiosk
-Exec=bash -c "cd /home/beedisplay/projects/LED_Bee_motion_project- && source .venv/bin/activate && nice -n 10 python3 -u bee_system.py"
+Name=Bee System - Run
+Exec=lxterminal -e bash -c "cd /home/beedisplay/projects/LED_Bee_motion_project- && source .venv/bin/activate && python3 -u bee_system.py; read -p 'Press Enter to close...'"
 Icon=media-playback-start
-Terminal=true
+Terminal=false
 Categories=Application;
+StartupNotify=false

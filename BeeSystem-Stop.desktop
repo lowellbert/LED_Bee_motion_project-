@@ -1,9 +1,9 @@
 [Desktop Entry]
 Version=1.0
 Type=Application
-Name=Bee System — Stop
-Comment=Stop the Bee Motion Video System
-Exec=bash -c "pkill -f bee_system.py && echo 'Bee System stopped.' && sleep 2"
+Name=Bee System - Stop
+Exec=lxterminal -e bash -c "pkill -f bee_system.py && echo 'Stopped.' || echo 'Not running.'; sleep 2"
 Icon=media-playback-stop
-Terminal=true
+Terminal=false
 Categories=Application;
+StartupNotify=false
