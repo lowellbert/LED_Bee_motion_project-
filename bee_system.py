@@ -102,9 +102,9 @@ def start_keyboard_exit_listener():
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VIDEO_IDLE    = Path("/home/beedisplay/projects/LED_Bee_motion_project-/videos/idle.mp4")
-VIDEO_REACT_1 = Path("/home/beedisplay/projects/LED_Bee_motion_project-/videos/react_1.mp4")
-VIDEO_REACT_2 = Path("/home/beedisplay/projects/LED_Bee_motion_project-/videos/react_2.mp4")
+VIDEO_IDLE    = Path("/dev/shm/bee_videos/idle.mp4")
+VIDEO_REACT_1 = Path("/dev/shm/bee_videos/react_1.mp4")
+VIDEO_REACT_2 = Path("/dev/shm/bee_videos/react_2.mp4")
 
 # Camera capture -- Pi Camera 3 Wide native resolution modes
 # 1536x864 @ 120fps is the sweet spot for this use case
