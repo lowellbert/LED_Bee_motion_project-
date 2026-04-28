@@ -46,41 +46,56 @@ signal.signal(signal.SIGTERM, _handle_signal)
 signal.signal(signal.SIGINT,  _handle_signal)
 
 def start_keyboard_exit_listener():
-    def on_press(key):
+    """
+    Listens for ESC at kernel level using evdev.
+    Bypasses X11, VLC fullscreen, and window focus entirely.
+    Works in kiosk mode, debug mode, and everything in between.
+    """
+    import evdev
+    from evdev import InputDevice, categorize, ecodes, list_devices
+
+    def find_keyboards():
+        devices = []
+        for path in list_devices():
+            try:
+                dev = InputDevice(path)
+                caps = dev.capabilities()
+                if ecodes.EV_KEY in caps:
+                    if ecodes.KEY_ESC in caps[ecodes.EV_KEY]:
+                        devices.append(dev)
+                        print(f"[KeyListener] Found keyboard: {dev.name}")
+            except Exception:
+                pass
+        return devices
+
+    def listen(device):
         global _shutdown_requested
         try:
-            # ESC key (easy + universal)
-            if key == keyboard.Key.esc:
-                print("[EXIT] ESC pressed — shutting down")
-                _shutdown_requested = True
-                return False
+            for event in device.read_loop():
+                if _shutdown_requested:
+                    break
+                if event.type == ecodes.EV_KEY:
+                    key = categorize(event)
+                    if key.keystate == key.key_down:
+                        if key.keycode == "KEY_ESC":
+                            print("[KeyListener] ESC pressed -- shutting down")
+                            _shutdown_requested = True
+                            return
+        except Exception as e:
+            print(f"[KeyListener] Error: {e}")
 
-            # Ctrl + Alt + Q (hard to trigger accidentally)
-            if (
-                key.char == 'q' and
-                keyboard.Key.ctrl_l in listener._pressed_keys and
-                keyboard.Key.alt_l  in listener._pressed_keys
-            ):
-                print("[EXIT] Ctrl+Alt+Q pressed — shutting down")
-                _shutdown_requested = True
-                return False
+    keyboards = find_keyboards()
+    if not keyboards:
+        print("[KeyListener] No keyboards found -- ESC exit unavailable")
+        return
 
-        except AttributeError:
-            pass
+    for kb in keyboards:
+        t = threading.Thread(
+            target=listen, args=(kb,), daemon=True, name="KeyListener"
+        )
+        t.start()
 
-    listener = keyboard.Listener(on_press=on_press, suppress=False)
-    listener._pressed_keys = set()
-
-    def remember(key):
-        if key in (keyboard.Key.ctrl_l, keyboard.Key.alt_l):
-            listener._pressed_keys.add(key)
-
-    def forget(key):
-        listener._pressed_keys.discard(key)
-
-    listener.on_press = lambda k: (remember(k), on_press(k))[1]
-    listener.on_release = forget
-    listener.start()
+    print(f"[KeyListener] Listening on {len(keyboards)} device(s) -- ESC to exit")
 
 
 # -----------------------------------------------------------------------------
