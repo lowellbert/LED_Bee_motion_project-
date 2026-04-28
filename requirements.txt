@@ -1,6 +1,11 @@
 # Bee Motion Video Kiosk — Python Dependencies
-# opencv and numpy are installed via apt (system packages)
-# picamera2 is installed via apt
+# opencv, numpy and picamera2 are installed via apt (system packages)
 
 # Video playback
 python-vlc==3.0.21203
+
+# Keyboard exit listener (kiosk-safe, works without X focus)
+evdev
+
+# Alternative keyboard listener
+pynput
