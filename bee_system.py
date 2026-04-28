@@ -28,6 +28,7 @@ import signal
 import numpy as np
 from pathlib import Path
 from picamera2 import Picamera2
+from pynput import keyboard
 
 # -- Force display environment for SSH + local HDMI --------------------------
 os.environ.setdefault("DISPLAY", ":0")
@@ -43,6 +44,44 @@ def _handle_signal(signum, frame):
 
 signal.signal(signal.SIGTERM, _handle_signal)
 signal.signal(signal.SIGINT,  _handle_signal)
+
+def start_keyboard_exit_listener():
+    def on_press(key):
+        global _shutdown_requested
+        try:
+            # ESC key (easy + universal)
+            if key == keyboard.Key.esc:
+                print("[EXIT] ESC pressed — shutting down")
+                _shutdown_requested = True
+                return False
+
+            # Ctrl + Alt + Q (hard to trigger accidentally)
+            if (
+                key.char == 'q' and
+                keyboard.Key.ctrl_l in listener._pressed_keys and
+                keyboard.Key.alt_l  in listener._pressed_keys
+            ):
+                print("[EXIT] Ctrl+Alt+Q pressed — shutting down")
+                _shutdown_requested = True
+                return False
+
+        except AttributeError:
+            pass
+
+    listener = keyboard.Listener(on_press=on_press, suppress=False)
+    listener._pressed_keys = set()
+
+    def remember(key):
+        if key in (keyboard.Key.ctrl_l, keyboard.Key.alt_l):
+            listener._pressed_keys.add(key)
+
+    def forget(key):
+        listener._pressed_keys.discard(key)
+
+    listener.on_press = lambda k: (remember(k), on_press(k))[1]
+    listener.on_release = forget
+    listener.start()
+
 
 # -----------------------------------------------------------------------------
 # CONFIG
@@ -123,7 +162,16 @@ class FrameGrabber:
 
         config = self._cam.create_video_configuration(
             main={"size": (width, height), "format": "BGR888"},
-            controls={"FrameRate": float(fps)},
+            controls={
+                "FrameRate": float(fps),
+                "AwbEnable": True,
+                "AwbMode": 0,
+                "Brightness": 0.0,
+                "Contrast": 1.05,
+                "Saturation": 1.1,
+                "Sharpness": 1.2,
+                "NoiseReductionMode": 2
+            },
             buffer_count=2,
         )
         self._cam.configure(config)
@@ -153,6 +201,7 @@ class FrameGrabber:
                 t0    = time.time()
                 frame = self._cam.capture_array("main")
                 if frame is not None:
+                    frame = self._correct_colour(frame)
                     with self._lock:
                         self._frame     = frame
                         self._last_time = time.time()
@@ -163,6 +212,15 @@ class FrameGrabber:
             except Exception as e:
                 print(f"[FrameGrabber] Capture error: {e}")
                 time.sleep(0.1)
+
+    @staticmethod
+    def _correct_colour(frame):
+        """
+        imx708_wide outputs RGB channel order despite BGR888 format label.
+        Single channel swap corrects colours for OpenCV BGR expectation.
+        Orange looks orange, faces look natural, whites stay white.
+        """
+        return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
     def get_latest_frame(self):
         with self._lock:
@@ -365,6 +423,7 @@ def main():
 
     player   = BeePlayer(fullscreen=not debug_mode)
     detector = MotionDetector()
+    start_keyboard_exit_listener()
 
     last_motion_time = 0.0
     last_detect_time = 0.0
@@ -374,6 +433,7 @@ def main():
     motion_confirm   = 0
     frame_count      = 0
 
+    
     if debug_mode:
         cv2.namedWindow("Bee Debug -- press D to toggle", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("Bee Debug -- press D to toggle", 640, 480)
