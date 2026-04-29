@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Bee Kiosk
+Exec=bash -c "sleep 8 && /home/beedisplay/projects/LED_Bee_motion_project-/run.sh >> /home/beedisplay/bee_kiosk.log 2>&1"
+Hidden=false
+NoDisplay=false
+X-GNOME-Autostart-enabled=true
