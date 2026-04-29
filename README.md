@@ -67,7 +67,7 @@ Camera watches for motion
 | Power        | Official Raspberry Pi 27W USB-C Power Supply                      |
 | Keyboard     | USB keyboard (for setup and exit shortcut)                        |
 
-### Why Raspberry Pi 5?
+###  Raspberry Pi 5 Performance
 
 | Metric         | Pi 4 (1GB) - old | Pi 5 (4GB) - current |
 |----------------|------------------|----------------------|
@@ -77,15 +77,15 @@ Camera watches for motion
 | Grabber thread | Spinning 80+/s   | Sleeping             |
 | nice workaround| Required         | Not needed           |
 
-### Why Camera Module 3 Wide?
+###  Camera Module 3 Wide
 
-| Feature       | USB Webcam (old)        | Camera Module 3 Wide (current)  |
-|---------------|-------------------------|---------------------------------|
-| Interface     | USB / V4L2              | MIPI CSI - native Pi pipeline   |
-| Min FPS       | 15fps hardware limit    | Fully configurable              |
-| CPU cost      | High - V4L2 buffer spin | Low - ISP hardware pipeline     |
-| Field of view | Narrow                  | 120 degrees wide angle          |
-| Resolution    | 320x240 capture         | 1536x864 at 30fps               |
+| Feature       | Camera Module 3 Wide (current)  |
+|---------------|---------------------------------|
+| Interface     | MIPI CSI - native Pi pipeline   |
+| Min FPS       | Fully configurable              |
+| CPU cost      | Low - ISP hardware pipeline     |
+| Field of view | 120 degrees wide angle          |
+| Resolution    | 1536x864 at 30fps               |
 
 > Note: The Camera Module 3 Wide (imx708_wide) outputs frames in RGB
 > channel order despite the BGR888 format label. The system applies a
@@ -130,7 +130,6 @@ To start manually:
 | Method           | How                                          |
 |------------------|----------------------------------------------|
 | ESC key          | Press ESC on any attached keyboard           |
-| Ctrl + Alt + Q   | Alternative keyboard shortcut                |
 | Desktop icon     | Double-click BeeSystem Stop on desktop       |
 | Remote SSH       | Run: pkill -f bee_system.py                  |
 
@@ -260,25 +259,6 @@ After changes, save the file and restart the system.
 | Triggers too often            | Sensitivity too high           | Increase MOG2_THRESHOLD and MIN_AREA in config           |
 | Not detecting at distance     | Sensitivity too low            | Decrease MOG2_THRESHOLD and MIN_AREA in config           |
 
----
-
-## Hardware Shopping List (Canada)
-
-| Item                              | Source    | Price CAD |
-|-----------------------------------|-----------|-----------|
-| Raspberry Pi 5 4GB                | PiShop.ca | ~$95      |
-| Official Pi 5 Active Cooler       | PiShop.ca | ~$7       |
-| Official Pi 27W USB-C PSU         | PiShop.ca | ~$17      |
-| Camera Module 3 Wide              | PiShop.ca | ~$51      |
-| Pi 5 Camera Cable 200mm           | PiShop.ca | ~$3       |
-| HighPi Pro 5S Case                | PiShop.ca | ~$15      |
-| Tripod Camera Mount               | PiShop.ca | ~$6       |
-| UGREEN 65W Dual USB-C GaN Charger | Amazon.ca | ~$30      |
-| Articulating camera arm           | Amazon.ca | ~$20      |
-| Total                             |           | ~$244     |
-
-> The UGREEN 65W charger powers both the Pi 5 (27W) and a USB-C
-> portable display (10W) simultaneously from a single wall outlet.
 
 ---
 
