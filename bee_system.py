@@ -108,7 +108,7 @@ def start_keyboard_exit_listener():
 
 _VIDEO_DIR  = Path("/home/beedisplay/projects/LED_Bee_motion_project-/videos")
 
-IDEO_IDLE    = _VIDEO_DIR / "idle.mp4"
+VIDEO_IDLE    = _VIDEO_DIR / "idle.mp4"
 VIDEO_REACT_1 = _VIDEO_DIR / "react_1.mp4"
 VIDEO_REACT_2 = _VIDEO_DIR / "react_2.mp4"
 
