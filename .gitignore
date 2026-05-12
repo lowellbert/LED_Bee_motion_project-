@@ -17,3 +17,9 @@ venv/
 .idea/
 .DS_Store
 bee_system_pi4_backup.py
+# Video files — client managed, not in git
+videos/*.mp4
+videos/old/
+
+# Misc
+IDLE
