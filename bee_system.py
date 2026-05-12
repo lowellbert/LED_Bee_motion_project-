@@ -102,11 +102,13 @@ def start_keyboard_exit_listener():
 # CONFIG
 # -----------------------------------------------------------------------------
 
-_VIDEO_RAM  = Path("/dev/shm/bee_videos")
-_VIDEO_DISK = Path("/home/beedisplay/projects/LED_Bee_motion_project-/videos")
-_VIDEO_DIR  = _VIDEO_RAM if (_VIDEO_RAM / "idle.mp4").exists() else _VIDEO_DISK
+#_VIDEO_RAM  = Path("/dev/shm/bee_videos")
+#_VIDEO_DISK = Path("/home/beedisplay/projects/LED_Bee_motion_project-/videos")
+#_VIDEO_DIR  = _VIDEO_RAM if (_VIDEO_RAM / "idle.mp4").exists() else _VIDEO_DISK
 
-VIDEO_IDLE    = _VIDEO_DIR / "idle.mp4"
+_VIDEO_DIR  = Path("/home/beedisplay/projects/LED_Bee_motion_project-/videos")
+
+IDEO_IDLE    = _VIDEO_DIR / "idle.mp4"
 VIDEO_REACT_1 = _VIDEO_DIR / "react_1.mp4"
 VIDEO_REACT_2 = _VIDEO_DIR / "react_2.mp4"
 
